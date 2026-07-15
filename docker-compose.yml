@@ -1,0 +1,48 @@
+services:
+  nyanform:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: nyanform:latest
+    container_name: nyanform
+    stdin_open: true
+    tty: true
+    entrypoint: ["/app/nyanform"]
+    command:
+      - serve
+      - --stdio-command
+      - node
+      - --stdio-arg
+      - /app/example-server.js
+      - --profile
+      - auto
+      - --policy
+      - strict
+    volumes:
+      - ./test/fixtures/mcp_server.js:/app/example-server.js:ro
+    restart: unless-stopped
+
+  nyanform-http:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: nyanform:latest
+    container_name: nyanform-http
+    ports:
+      - "127.0.0.1:8080:8080"
+    entrypoint: ["/app/nyanform"]
+    command:
+      - serve
+      - --downstream-transport
+      - http
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --http-endpoint
+      - https://internal.example.com/mcp
+      - --profile
+      - vscode
+    profiles:
+      - http
+    restart: unless-stopped

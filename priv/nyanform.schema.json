@@ -1,0 +1,140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Ducheved/nyanform/priv/nyanform.schema.json",
+  "title": "Nyanform configuration",
+  "description": "Configuration file for the Nyanform MCP compatibility proxy. Loaded by Nyanform.Config.Loader.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["upstream"],
+  "properties": {
+    "downstream": {
+      "description": "Transport facing the MCP client. Defaults to stdio.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "transport": {
+          "description": "Downstream transport mode.",
+          "type": "string",
+          "enum": ["stdio", "http"]
+        },
+        "port": {
+          "description": "TCP port for HTTP downstream. Ignored when transport is stdio. Defaults to 8080.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "default": 8080
+        },
+        "host": {
+          "description": "Bind address for HTTP downstream. Defaults to 127.0.0.1. Use 0.0.0.0 to expose externally (not recommended without TLS).",
+          "type": "string",
+          "default": "127.0.0.1"
+        },
+        "allowedOrigins": {
+          "description": "HTTP Origin values accepted by the downstream server. With an empty list, requests without Origin are accepted; browser Origins are accepted only for loopback Origins on a loopback bind. Non-loopback binds require an explicit list for Origin-bearing requests.",
+          "type": "array",
+          "items": {"type": "string"},
+          "default": []
+        }
+      }
+    },
+    "upstream": {
+      "description": "Transport facing the MCP server. Exactly one of command (stdio) or endpoint (http) must be provided.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["transport"],
+      "properties": {
+        "transport": {
+          "description": "Upstream transport mode.",
+          "type": "string",
+          "enum": ["stdio", "http"]
+        },
+        "command": {
+          "description": "For stdio transport. The argv passed to spawn_executable. The first element is the executable, the rest are arguments. No shell is used.",
+          "type": "array",
+          "items": {"type": "string"},
+          "minItems": 1
+        },
+        "endpoint": {
+          "description": "For http transport. The full URL of the upstream MCP server (e.g. https://internal.example.com/mcp).",
+          "type": "string",
+          "format": "uri"
+        },
+        "env": {
+          "description": "Environment variables passed to a stdio upstream. Only these keys are propagated; the parent environment is not inherited wholesale.",
+          "type": "object",
+          "additionalProperties": {"type": "string"}
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "transport": {"const": "stdio"},
+            "command": {"type": "array", "minItems": 1}
+          },
+          "required": ["command"],
+          "not": {"required": ["endpoint"]}
+        },
+        {
+          "properties": {
+            "transport": {"const": "http"},
+            "endpoint": {"type": "string", "minLength": 1}
+          },
+          "required": ["endpoint"],
+          "not": {"required": ["command"]}
+        }
+      ]
+    },
+    "profile": {
+      "description": "Compatibility profile used to project upstream schemas. Use auto to detect from clientInfo.name at initialize time.",
+      "type": "string",
+      "enum": ["canonical", "claude", "gemini", "openai_strict", "vscode", "passthrough", "auto"],
+      "default": "canonical"
+    },
+    "policy": {
+      "description": "Projection policy. strict rejects lossy and rejected omens; compatible rejects only rejected; permissive accepts everything.",
+      "type": "string",
+      "enum": ["strict", "compatible", "permissive"],
+      "default": "strict"
+    },
+    "envAllowlist": {
+      "description": "Additional parent environment variables inherited by a stdio upstream. A minimal set of system variables needed to launch processes is always inherited, and explicit upstream.env values override inherited values.",
+      "type": "array",
+      "items": {"type": "string"},
+      "default": []
+    },
+    "timeoutMs": {
+      "description": "Per-request timeout in milliseconds, applied to both upstream GenServer calls and Req receive_timeout.",
+      "type": "integer",
+      "minimum": 1,
+      "default": 30000
+    },
+    "maxMessageSize": {
+      "description": "Maximum size in bytes of a single JSON-RPC frame before it is rejected as too large. Checked before JSON decoding.",
+      "type": "integer",
+      "minimum": 1,
+      "default": 1048576
+    },
+    "maxHttpBodySize": {
+      "description": "Maximum size in bytes of an HTTP request body accepted by the downstream HTTP server.",
+      "type": "integer",
+      "minimum": 1,
+      "default": 4194304
+    },
+    "logging": {
+      "description": "Log verbosity. quiet suppresses info, verbose enables debug-level metadata.",
+      "type": "string",
+      "enum": ["quiet", "normal", "verbose"],
+      "default": "normal"
+    },
+    "toolInclude": {
+      "description": "Allowlist of tool names to expose to the client. If omitted, all upstream tools are exposed. Mutually exclusive with toolExclude in practice.",
+      "type": ["array", "null"],
+      "items": {"type": "string"}
+    },
+    "toolExclude": {
+      "description": "Blocklist of tool names to hide from the client. If omitted, no tools are excluded.",
+      "type": ["array", "null"],
+      "items": {"type": "string"}
+    }
+  }
+}

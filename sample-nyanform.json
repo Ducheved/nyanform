@@ -1,0 +1,16 @@
+{
+  "downstream": {
+    "transport": "stdio"
+  },
+  "upstream": {
+    "transport": "stdio",
+    "command": ["node", "server.js"],
+    "env": {
+      "NODE_ENV": "production"
+    }
+  },
+  "profile": "claude",
+  "policy": "strict",
+  "timeoutMs": 30000,
+  "logging": "normal"
+}

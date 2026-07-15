@@ -1,0 +1,2 @@
+defmodule Nyanform do
+end
