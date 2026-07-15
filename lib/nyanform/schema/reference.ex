@@ -1,4 +1,5 @@
 defmodule Nyanform.Schema.Reference do
+  alias Nyanform.Limits
   alias Nyanform.Schema.Scroll
   alias Nyanform.Schema.ValidationError
 
@@ -28,6 +29,42 @@ defmodule Nyanform.Schema.Reference do
   end
 
   def to_string(%__MODULE__{uri: uri, fragment: {:anchor, anchor}}), do: uri <> "#" <> anchor
+
+  @spec normalize_definition_refs(term()) :: term()
+  def normalize_definition_refs(schema) do
+    normalize_definition_refs(schema, Limits.default().max_schema_depth)
+  end
+
+  @spec normalize_definition_refs(term(), non_neg_integer()) :: term()
+  def normalize_definition_refs(schema, max_depth)
+      when is_map(schema) and is_integer(max_depth) and max_depth >= 0 do
+    normalize_definition_refs_at(schema, schema, 0, max_depth)
+  end
+
+  def normalize_definition_refs(schema, max_depth)
+      when is_integer(max_depth) and max_depth >= 0,
+      do: schema
+
+  @spec dangling_local_refs(term()) :: [%{path: Scroll.path(), reference: String.t()}]
+  def dangling_local_refs(schema) do
+    dangling_local_refs(schema, Limits.default().max_schema_depth)
+  end
+
+  @spec dangling_local_refs(term(), non_neg_integer()) :: [
+          %{path: Scroll.path(), reference: String.t()}
+        ]
+  def dangling_local_refs(schema, max_depth)
+      when is_map(schema) and is_integer(max_depth) and max_depth >= 0 do
+    normalized = normalize_definition_refs(schema, max_depth)
+
+    normalized
+    |> collect_dangling_local_refs(normalized, [], 0, max_depth)
+    |> Enum.sort_by(fn %{path: path, reference: reference} -> {path, reference} end)
+  end
+
+  def dangling_local_refs(_schema, max_depth)
+      when is_integer(max_depth) and max_depth >= 0,
+      do: []
 
   @spec local?(t()) :: boolean()
   def local?(%__MODULE__{uri: ""}), do: true
@@ -201,4 +238,315 @@ defmodule Nyanform.Schema.Reference do
     |> String.replace("~", "~0")
     |> String.replace("/", "~1")
   end
+
+  defp collect_dangling_local_refs(schema, root, path, depth, max_depth)
+       when is_map(schema) do
+    own = dangling_ref(schema, root, path, max_depth)
+
+    if depth >= max_depth do
+      own
+    else
+      own ++
+        collect_schema_maps(
+          schema,
+          root,
+          path,
+          ~w(properties patternProperties $defs definitions dependentSchemas),
+          depth,
+          max_depth
+        ) ++
+        collect_schema_children(
+          schema,
+          root,
+          path,
+          ~w(additionalProperties additionalItems items not if then else contains propertyNames
+             unevaluatedProperties unevaluatedItems contentSchema),
+          depth,
+          max_depth
+        ) ++
+        collect_schema_lists(
+          schema,
+          root,
+          path,
+          ~w(prefixItems allOf anyOf oneOf),
+          depth,
+          max_depth
+        )
+    end
+  end
+
+  defp collect_dangling_local_refs(_schema, _root, _path, _depth, _max_depth), do: []
+
+  defp dangling_ref(%{"$ref" => reference}, root, path, max_depth)
+       when is_binary(reference) do
+    case parse(reference) do
+      {:ok, %__MODULE__{uri: "", fragment: {:pointer, tokens}}} ->
+        if pointer_exists?(root, tokens, max_depth) do
+          []
+        else
+          [%{path: path ++ ["$ref"], reference: reference}]
+        end
+
+      _ ->
+        []
+    end
+  end
+
+  defp dangling_ref(_schema, _root, _path, _max_depth), do: []
+
+  defp collect_schema_maps(schema, root, path, keys, depth, max_depth) do
+    Enum.flat_map(keys, fn key ->
+      case Map.get(schema, key) do
+        children when is_map(children) ->
+          children
+          |> Enum.sort_by(&elem(&1, 0))
+          |> Enum.flat_map(fn {name, child} ->
+            collect_dangling_local_refs(
+              child,
+              root,
+              path ++ [key, name],
+              depth + 1,
+              max_depth
+            )
+          end)
+
+        _ ->
+          []
+      end
+    end)
+  end
+
+  defp collect_schema_children(schema, root, path, keys, depth, max_depth) do
+    Enum.flat_map(keys, fn key ->
+      case Map.get(schema, key) do
+        children when is_list(children) ->
+          children
+          |> Enum.with_index()
+          |> Enum.flat_map(fn {child, index} ->
+            collect_dangling_local_refs(
+              child,
+              root,
+              path ++ [key, Integer.to_string(index)],
+              depth + 1,
+              max_depth
+            )
+          end)
+
+        child ->
+          collect_dangling_local_refs(child, root, path ++ [key], depth + 1, max_depth)
+      end
+    end)
+  end
+
+  defp collect_schema_lists(schema, root, path, keys, depth, max_depth) do
+    Enum.flat_map(keys, fn key ->
+      case Map.get(schema, key) do
+        children when is_list(children) ->
+          children
+          |> Enum.with_index()
+          |> Enum.flat_map(fn {child, index} ->
+            collect_dangling_local_refs(
+              child,
+              root,
+              path ++ [key, Integer.to_string(index)],
+              depth + 1,
+              max_depth
+            )
+          end)
+
+        _ ->
+          []
+      end
+    end)
+  end
+
+  defp pointer_exists?(root, tokens, max_depth),
+    do: pointer_exists_at?(root, tokens, 0, max_depth)
+
+  defp pointer_exists_at?(_current, [], _depth, _max_depth), do: true
+
+  defp pointer_exists_at?(_current, [_token | _rest], depth, max_depth)
+       when depth >= max_depth,
+       do: true
+
+  defp pointer_exists_at?(current, [token | rest], depth, max_depth) do
+    case fetch_pointer_token(current, token) do
+      {:ok, next} -> pointer_exists_at?(next, rest, depth + 1, max_depth)
+      :error -> false
+    end
+  end
+
+  defp fetch_pointer_token(current, token) when is_map(current), do: Map.fetch(current, token)
+
+  defp fetch_pointer_token(current, token) when is_list(current) do
+    case Integer.parse(token) do
+      {index, ""} when index >= 0 ->
+        if Integer.to_string(index) == token and index < length(current),
+          do: {:ok, Enum.at(current, index)},
+          else: :error
+
+      _ ->
+        :error
+    end
+  end
+
+  defp fetch_pointer_token(_current, _token), do: :error
+
+  defp normalize_definition_refs_at(value, root, depth, max_depth) when is_map(value) do
+    normalized = normalize_ref(value, root, max_depth)
+
+    if depth >= max_depth do
+      normalized
+    else
+      normalized
+      |> normalize_schema_map("properties", root, depth, max_depth)
+      |> normalize_schema_map("patternProperties", root, depth, max_depth)
+      |> normalize_schema_map("$defs", root, depth, max_depth)
+      |> normalize_schema_map("definitions", root, depth, max_depth)
+      |> normalize_schema_map("dependentSchemas", root, depth, max_depth)
+      |> normalize_schema_child("additionalProperties", root, depth, max_depth)
+      |> normalize_schema_child("additionalItems", root, depth, max_depth)
+      |> normalize_schema_child("items", root, depth, max_depth)
+      |> normalize_schema_child("not", root, depth, max_depth)
+      |> normalize_schema_child("if", root, depth, max_depth)
+      |> normalize_schema_child("then", root, depth, max_depth)
+      |> normalize_schema_child("else", root, depth, max_depth)
+      |> normalize_schema_child("contains", root, depth, max_depth)
+      |> normalize_schema_child("propertyNames", root, depth, max_depth)
+      |> normalize_schema_child("unevaluatedProperties", root, depth, max_depth)
+      |> normalize_schema_child("unevaluatedItems", root, depth, max_depth)
+      |> normalize_schema_child("contentSchema", root, depth, max_depth)
+      |> normalize_schema_list("prefixItems", root, depth, max_depth)
+      |> normalize_schema_list("allOf", root, depth, max_depth)
+      |> normalize_schema_list("anyOf", root, depth, max_depth)
+      |> normalize_schema_list("oneOf", root, depth, max_depth)
+    end
+  end
+
+  defp normalize_definition_refs_at(value, _root, _depth, _max_depth), do: value
+
+  defp normalize_ref(%{"$ref" => ref} = schema, root, max_depth) when is_binary(ref) do
+    Map.put(schema, "$ref", normalize_definition_ref(ref, root, max_depth))
+  end
+
+  defp normalize_ref(schema, _root, _max_depth), do: schema
+
+  defp normalize_schema_map(schema, key, root, depth, max_depth) do
+    case Map.get(schema, key) do
+      children when is_map(children) ->
+        Map.put(
+          schema,
+          key,
+          Map.new(children, fn {name, child} ->
+            {name, normalize_definition_refs_at(child, root, depth + 1, max_depth)}
+          end)
+        )
+
+      _ ->
+        schema
+    end
+  end
+
+  defp normalize_schema_child(schema, key, root, depth, max_depth) do
+    case Map.get(schema, key) do
+      child when is_map(child) ->
+        Map.put(
+          schema,
+          key,
+          normalize_definition_refs_at(child, root, depth + 1, max_depth)
+        )
+
+      children when is_list(children) ->
+        Map.put(
+          schema,
+          key,
+          Enum.map(
+            children,
+            &normalize_definition_refs_at(&1, root, depth + 1, max_depth)
+          )
+        )
+
+      _ ->
+        schema
+    end
+  end
+
+  defp normalize_schema_list(schema, key, root, depth, max_depth) do
+    case Map.get(schema, key) do
+      children when is_list(children) ->
+        Map.put(
+          schema,
+          key,
+          Enum.map(
+            children,
+            &normalize_definition_refs_at(&1, root, depth + 1, max_depth)
+          )
+        )
+
+      _ ->
+        schema
+    end
+  end
+
+  defp normalize_definition_ref(ref, root, max_depth) do
+    case parse(ref) do
+      {:ok, %__MODULE__{uri: "", fragment: {:pointer, tokens}} = reference} ->
+        normalized = normalize_pointer(tokens, root, [], 0, max_depth)
+        __MODULE__.to_string(%__MODULE__{reference | fragment: {:pointer, normalized}})
+
+      _ ->
+        ref
+    end
+  end
+
+  defp normalize_pointer([], _current, acc, _depth, _max_depth), do: Enum.reverse(acc)
+
+  defp normalize_pointer(tokens, _current, acc, depth, max_depth) when depth >= max_depth,
+    do: Enum.reverse(acc) ++ tokens
+
+  defp normalize_pointer([token | rest], current, acc, depth, max_depth)
+       when is_map(current) do
+    cond do
+      Map.has_key?(current, token) ->
+        normalize_pointer(
+          rest,
+          Map.fetch!(current, token),
+          [token | acc],
+          depth + 1,
+          max_depth
+        )
+
+      token == "definitions" and Map.has_key?(current, "$defs") ->
+        normalize_pointer(
+          rest,
+          Map.fetch!(current, "$defs"),
+          ["$defs" | acc],
+          depth + 1,
+          max_depth
+        )
+
+      true ->
+        Enum.reverse(acc) ++ [token | rest]
+    end
+  end
+
+  defp normalize_pointer([token | rest], current, acc, depth, max_depth)
+       when is_list(current) do
+    case Integer.parse(token) do
+      {index, ""} when index >= 0 and index < length(current) ->
+        normalize_pointer(
+          rest,
+          Enum.at(current, index),
+          [token | acc],
+          depth + 1,
+          max_depth
+        )
+
+      _ ->
+        Enum.reverse(acc) ++ [token | rest]
+    end
+  end
+
+  defp normalize_pointer(tokens, _current, acc, _depth, _max_depth),
+    do: Enum.reverse(acc) ++ tokens
 end

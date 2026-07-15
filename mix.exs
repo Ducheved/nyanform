@@ -98,7 +98,7 @@ defmodule Nyanform.MixProject do
     [
       name: "nyanform",
       description:
-        "Make one MCP server work everywhere. A local-first MCP compatibility proxy and schema compiler.",
+        "Inspect and adapt MCP tool schemas across client boundaries with a local-first compatibility proxy.",
       licenses: ["MIT"],
       links: %{"GitHub" => "https://github.com/Ducheved/nyanform"}
     ]

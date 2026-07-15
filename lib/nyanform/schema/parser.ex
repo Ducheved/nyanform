@@ -2,6 +2,13 @@ defmodule Nyanform.Schema.Parser do
   alias Nyanform.Schema.{Reference, Scroll}
 
   @type combinator :: :oneOf | :anyOf | :allOf | nil
+  @schema_types ~w(object array string integer number boolean null)
+  @map_keywords ~w(properties patternProperties $defs definitions)
+  @branch_keywords ~w(oneOf anyOf allOf)
+  @additional_keywords ~w(additionalProperties additionalItems)
+  @string_keywords ~w(description title format pattern $ref $schema $id)
+  @non_negative_integer_keywords ~w(minLength maxLength minItems maxItems minProperties maxProperties)
+  @number_keywords ~w(minimum maximum exclusiveMinimum exclusiveMaximum)
 
   @spec parse(term(), Scroll.path(), non_neg_integer(), pos_integer()) ::
           {:ok, Scroll.t()} | {:error, Nyanform.Schema.ValidationError.t()}
@@ -11,8 +18,8 @@ defmodule Nyanform.Schema.Parser do
     {:error, %Nyanform.Schema.ValidationError{code: :schema_depth_exceeded, path: ["__root__"]}}
   end
 
-  def parse(true, path, _depth, _max_depth), do: {:ok, Scroll.any(path)}
-  def parse(false, path, _depth, _max_depth), do: {:ok, Scroll.never(path)}
+  def parse(true, path, _depth, _max_depth), do: {:ok, %{Scroll.any(path) | raw: true}}
+  def parse(false, path, _depth, _max_depth), do: {:ok, %{Scroll.never(path) | raw: false}}
   def parse(%Scroll{} = scroll, _path, _depth, _max_depth), do: {:ok, scroll}
 
   def parse(node, path, depth, max_depth) when is_map(node) do
@@ -68,16 +75,200 @@ defmodule Nyanform.Schema.Parser do
       raw: node
     }
 
-    cond do
-      combinator != nil ->
-        parse_combinator(base, node, combinator, path, depth, max_depth)
+    with :ok <- validate_type_keyword(node, path),
+         :ok <- validate_keyword_shapes(node, path, depth, max_depth) do
+      cond do
+        combinator != nil ->
+          parse_combinator(base, node, combinator, path, depth, max_depth)
 
-      has_ref ->
-        parse_ref_node(base, node)
+        has_ref ->
+          parse_ref_node(base, node)
 
-      true ->
-        parse_value_node(base, node, has_const, has_enum, path, depth, max_depth)
+        true ->
+          parse_value_node(base, node, has_const, has_enum, path, depth, max_depth)
+      end
     end
+  end
+
+  defp validate_type_keyword(node, path) do
+    case Map.fetch(node, "type") do
+      :error -> :ok
+      {:ok, type} -> validate_type_value(type, path)
+    end
+  end
+
+  defp validate_type_value(type, path) when is_binary(type) do
+    if type in @schema_types, do: :ok, else: invalid_type(path)
+  end
+
+  defp validate_type_value(types, path) when is_list(types) do
+    valid =
+      types != [] and
+        Enum.uniq(types) == types and
+        Enum.all?(types, &(is_binary(&1) and &1 in @schema_types))
+
+    if valid, do: :ok, else: invalid_type(path)
+  end
+
+  defp validate_type_value(_type, path), do: invalid_type(path)
+
+  defp invalid_type(path) do
+    {:error, %Nyanform.Schema.ValidationError{code: :invalid_type, path: path ++ ["type"]}}
+  end
+
+  defp validate_keyword_shapes(node, path, depth, max_depth) do
+    with :ok <- validate_keywords(node, @map_keywords, &valid_schema_map?/1, path),
+         :ok <- validate_keywords(node, ["required"], &valid_required?/1, path),
+         :ok <- validate_keywords(node, ["enum"], &is_list/1, path),
+         :ok <- validate_keywords(node, @branch_keywords, &valid_branches?/1, path),
+         :ok <- validate_keywords(node, @additional_keywords, &valid_schema_value?/1, path),
+         :ok <- validate_keywords(node, ["items"], &valid_items?/1, path),
+         :ok <- validate_keywords(node, @string_keywords, &is_binary/1, path),
+         :ok <- validate_keywords(node, ["examples"], &is_list/1, path),
+         :ok <-
+           validate_keywords(
+             node,
+             @non_negative_integer_keywords,
+             &non_negative_integer?/1,
+             path
+           ),
+         :ok <- validate_keywords(node, @number_keywords, &is_number/1, path),
+         :ok <- validate_keywords(node, ["multipleOf"], &positive_number?/1, path),
+         :ok <- validate_keywords(node, ["uniqueItems"], &is_boolean/1, path),
+         do: validate_schema_children(node, path, depth, max_depth)
+  end
+
+  defp validate_schema_children(node, path, depth, max_depth) do
+    with :ok <- validate_schema_maps(node, path, depth, max_depth),
+         :ok <- validate_schema_values(node, path, depth, max_depth),
+         :ok <- validate_schema_lists(node, path, depth, max_depth),
+         do: validate_items_children(node, path, depth, max_depth)
+  end
+
+  defp validate_schema_maps(node, path, depth, max_depth) do
+    Enum.reduce_while(@map_keywords, :ok, fn keyword, :ok ->
+      case Map.fetch(node, keyword) do
+        {:ok, schemas} ->
+          schemas
+          |> validate_schema_map_entries(path, keyword, depth, max_depth)
+          |> validation_step()
+
+        :error ->
+          {:cont, :ok}
+      end
+    end)
+  end
+
+  defp validate_schema_map_entries(schemas, path, keyword, depth, max_depth) do
+    Enum.reduce_while(schemas, :ok, fn {name, schema}, :ok ->
+      schema
+      |> validate_schema_term(path ++ [keyword, name], depth + 1, max_depth)
+      |> validation_step()
+    end)
+  end
+
+  defp validate_schema_values(node, path, depth, max_depth) do
+    Enum.reduce_while(@additional_keywords, :ok, fn keyword, :ok ->
+      case Map.fetch(node, keyword) do
+        {:ok, schema} ->
+          schema
+          |> validate_schema_term(path ++ [keyword], depth + 1, max_depth)
+          |> validation_step()
+
+        :error ->
+          {:cont, :ok}
+      end
+    end)
+  end
+
+  defp validate_schema_lists(node, path, depth, max_depth) do
+    Enum.reduce_while(@branch_keywords, :ok, fn keyword, :ok ->
+      case Map.fetch(node, keyword) do
+        {:ok, schemas} ->
+          schemas
+          |> validate_schema_list(path, keyword, depth, max_depth)
+          |> validation_step()
+
+        :error ->
+          {:cont, :ok}
+      end
+    end)
+  end
+
+  defp validate_items_children(node, path, depth, max_depth) do
+    case Map.fetch(node, "items") do
+      {:ok, schemas} when is_list(schemas) ->
+        validate_schema_list(schemas, path, "items", depth, max_depth)
+
+      {:ok, schema} ->
+        validate_schema_term(schema, path ++ ["items"], depth + 1, max_depth)
+
+      :error ->
+        :ok
+    end
+  end
+
+  defp validate_schema_list(schemas, path, keyword, depth, max_depth) do
+    schemas
+    |> Enum.with_index()
+    |> Enum.reduce_while(:ok, fn {schema, index}, :ok ->
+      child_path = path ++ [keyword, Integer.to_string(index)]
+
+      schema
+      |> validate_schema_term(child_path, depth + 1, max_depth)
+      |> validation_step()
+    end)
+  end
+
+  defp validation_step(:ok), do: {:cont, :ok}
+  defp validation_step({:error, _error} = error), do: {:halt, error}
+
+  defp validate_schema_term(_schema, path, depth, max_depth) when depth > max_depth do
+    {:error, %Nyanform.Schema.ValidationError{code: :schema_depth_exceeded, path: path}}
+  end
+
+  defp validate_schema_term(schema, _path, _depth, _max_depth) when is_boolean(schema), do: :ok
+
+  defp validate_schema_term(schema, path, depth, max_depth) when is_map(schema) do
+    with :ok <- validate_type_keyword(schema, path) do
+      validate_keyword_shapes(schema, path, depth, max_depth)
+    end
+  end
+
+  defp validate_schema_term(_schema, path, _depth, _max_depth) do
+    {:error,
+     %Nyanform.Schema.ValidationError{code: :invalid_schema_node, path: path ++ ["__root__"]}}
+  end
+
+  defp validate_keywords(node, keywords, predicate, path) do
+    Enum.reduce_while(keywords, :ok, fn keyword, :ok ->
+      case Map.fetch(node, keyword) do
+        :error ->
+          {:cont, :ok}
+
+        {:ok, value} ->
+          if predicate.(value), do: {:cont, :ok}, else: {:halt, invalid_keyword(path, keyword)}
+      end
+    end)
+  end
+
+  defp valid_schema_map?(value) do
+    is_map(value) and Enum.all?(Map.keys(value), &is_binary/1)
+  end
+
+  defp valid_required?(value), do: is_list(value) and Enum.all?(value, &is_binary/1)
+  defp valid_branches?(value), do: is_list(value) and value != []
+  defp valid_schema_value?(value), do: is_boolean(value) or is_map(value)
+  defp valid_items?(value), do: is_boolean(value) or is_map(value) or is_list(value)
+  defp non_negative_integer?(value), do: is_integer(value) and value >= 0
+  defp positive_number?(value), do: is_number(value) and value > 0
+
+  defp invalid_keyword(path, keyword) do
+    {:error,
+     %Nyanform.Schema.ValidationError{
+       code: :invalid_keyword_value,
+       path: path ++ [keyword]
+     }}
   end
 
   defp detect_combinator(%{"oneOf" => _}), do: :oneOf
@@ -229,11 +420,7 @@ defmodule Nyanform.Schema.Parser do
   end
 
   defp resolve_type(%{"type" => types}) when is_list(types) do
-    cond do
-      types == [] -> :any
-      length(types) == 1 -> type_atom(hd(types))
-      true -> :union_of_types
-    end
+    if length(types) == 1, do: type_atom(hd(types)), else: :union_of_types
   end
 
   defp resolve_type(%{"type" => type}) when is_binary(type), do: type_atom(type)
@@ -263,17 +450,22 @@ defmodule Nyanform.Schema.Parser do
   defp apply_type(%Scroll{} = scroll, :union_of_types, node, path, depth, max_depth) do
     types = Map.get(node, "type")
 
-    branches =
-      Enum.map(types, fn type ->
+    result =
+      types
+      |> Enum.with_index()
+      |> Enum.reduce_while({:ok, []}, fn {type, index}, {:ok, branches} ->
         single = Map.put(node, "type", type)
 
-        case parse(single, path ++ ["type:" <> type], depth + 1, max_depth) do
-          {:ok, s} -> s
-          {:error, _} -> %Scroll{kind: type_atom(type), path: path ++ ["type:" <> type]}
+        case parse(single, path ++ ["type", Integer.to_string(index)], depth + 1, max_depth) do
+          {:ok, branch} -> {:cont, {:ok, [branch | branches]}}
+          {:error, error} -> {:halt, {:error, error}}
         end
       end)
 
-    {:ok, %Scroll{scroll | kind: :union, branches: branches}}
+    case result do
+      {:ok, branches} -> {:ok, %Scroll{scroll | kind: :union, branches: Enum.reverse(branches)}}
+      {:error, error} -> {:error, error}
+    end
   end
 
   defp apply_type(%Scroll{} = scroll, :object, node, path, depth, max_depth) do
@@ -287,6 +479,7 @@ defmodule Nyanform.Schema.Parser do
              depth,
              max_depth
            ),
+         {:ok, required} <- parse_required(Map.get(node, "required"), path),
          {:ok, additional} <-
            parse_additional(
              Map.get(node, "additionalProperties"),
@@ -299,7 +492,7 @@ defmodule Nyanform.Schema.Parser do
        %Scroll{
          scroll
          | properties: properties,
-           required: Map.get(node, "required"),
+           required: required,
            pattern_properties: pattern_properties,
            additional_properties: additional,
            min_properties: Map.get(node, "minProperties"),
@@ -335,6 +528,22 @@ defmodule Nyanform.Schema.Parser do
         end
 
       is_map(items) ->
+        case parse(items, path ++ ["items"], depth + 1, max_depth) do
+          {:ok, parsed_items} ->
+            {:ok,
+             %Scroll{
+               scroll
+               | items: parsed_items,
+                 min_items: Map.get(node, "minItems"),
+                 max_items: Map.get(node, "maxItems"),
+                 unique_items: Map.get(node, "uniqueItems")
+             }}
+
+          error ->
+            error
+        end
+
+      is_boolean(items) ->
         case parse(items, path ++ ["items"], depth + 1, max_depth) do
           {:ok, parsed_items} ->
             {:ok,
@@ -416,6 +625,23 @@ defmodule Nyanform.Schema.Parser do
 
   defp parse_property_map(_raw, path, key, _depth, _max_depth) do
     {:error, %Nyanform.Schema.ValidationError{code: :invalid_property_map, path: path ++ [key]}}
+  end
+
+  defp parse_required(nil, _path), do: {:ok, nil}
+
+  defp parse_required(required, path) when is_list(required) do
+    if Enum.all?(required, &is_binary/1) do
+      {:ok, required}
+    else
+      invalid_required(path)
+    end
+  end
+
+  defp parse_required(_required, path), do: invalid_required(path)
+
+  defp invalid_required(path) do
+    {:error,
+     %Nyanform.Schema.ValidationError{code: :invalid_required, path: path ++ ["required"]}}
   end
 
   defp parse_additional(nil, _path, _key, _depth, _max_depth), do: {:ok, nil}

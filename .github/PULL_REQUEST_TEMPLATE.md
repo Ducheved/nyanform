@@ -26,19 +26,15 @@ Check the relevant items:
 
 ## Quality gates
 
-This pull request is not ready for review until all of the following pass
-locally:
+Record the checks run against the final commit:
 
-- [ ] `mix format --check-formatted`
-- [ ] `mix compile --warnings-as-errors`
-- [ ] `mix nyanform.no_comments`
-- [ ] `mix credo --strict`
-- [ ] `mix test`
-- [ ] `mix test --include property:true` (if the change touches the
-      schema compiler, projector, or argument repair)
-- [ ] `mix dialyzer`
+- [ ] Relevant focused tests
+- [ ] `mix ci` (format, warning-free compile, no-comments, Credo,
+      tests including the property tag, and Dialyzer)
+- [ ] Escript or Docker smoke test when packaging/runtime behavior changed
 
-Or, equivalently: `mix ci`.
+If a check was not run, explain why and rely on the corresponding CI job rather
+than marking it complete.
 
 ## Tests
 
@@ -59,3 +55,8 @@ behavior.
 If this change alters how schemas are canonicalized or projected, note
 that digests may change. Existing snapshots in `_snapshots/` may need to
 be regenerated. If so, explain why the change is intentional.
+
+Generated snapshots contain raw server metadata, tool descriptions, and input
+and output schemas. Confirm that changed snapshots were reviewed for secrets in
+descriptions, defaults, examples, annotations, enum/const values, and vendor
+extensions before committing them.

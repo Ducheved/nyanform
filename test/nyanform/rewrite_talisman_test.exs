@@ -55,6 +55,32 @@ defmodule Nyanform.RewriteTalismanTest do
       assert result.omens == []
     end
 
+    test "synthetic null for an optional property becomes omission" do
+      schema =
+        compile(%{
+          "type" => "object",
+          "properties" => %{"optional" => %{"type" => "string"}}
+        })
+
+      result = RewriteTalisman.repair(%{"optional" => nil}, schema, drop_optional_nulls: true)
+
+      refute Map.has_key?(result.arguments, "optional")
+      assert Enum.any?(result.omens, &(&1.code == "NYA-ARG-004"))
+    end
+
+    test "explicitly nullable optional property keeps null" do
+      schema =
+        compile(%{
+          "type" => "object",
+          "properties" => %{"optional" => %{"type" => ["string", "null"]}}
+        })
+
+      result = RewriteTalisman.repair(%{"optional" => nil}, schema)
+
+      assert Map.has_key?(result.arguments, "optional")
+      assert result.arguments["optional"] == nil
+    end
+
     test "non-JSON strings are not repaired" do
       args = %{"name" => "hello world"}
       schema = compile(%{"type" => "object", "properties" => %{"name" => %{"type" => "string"}}})

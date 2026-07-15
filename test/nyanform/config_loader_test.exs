@@ -104,6 +104,18 @@ defmodule Nyanform.ConfigLoaderTest do
     end
   end
 
+  test "does not return invalid environment values in errors" do
+    config = %{
+      "upstream" => %{
+        "transport" => "stdio",
+        "command" => ["node", "server.js"],
+        "env" => %{"API_TOKEN" => %{"secret" => "do-not-print"}}
+      }
+    }
+
+    assert {:error, {:invalid_upstream_env, :redacted}} = Loader.load_map(config)
+  end
+
   test "load_file handles decoded non-object JSON without raising" do
     path =
       Path.join(System.tmp_dir!(), "nyanform-config-#{System.unique_integer([:positive])}.json")

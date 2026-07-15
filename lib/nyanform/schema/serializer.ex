@@ -35,6 +35,8 @@ defmodule Nyanform.Schema.Serializer do
   end
 
   defp canonical_map(%Scroll{} = scroll) do
+    scroll = strip_non_semantic(scroll)
+
     base = [
       {:kind, scroll.kind}
     ]

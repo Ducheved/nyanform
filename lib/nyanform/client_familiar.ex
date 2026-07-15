@@ -30,8 +30,6 @@ defmodule Nyanform.ClientFamiliar do
   @client_patterns [
     {"claude", "claude"},
     {"cline", "claude"},
-    {"cursor", "openai_strict"},
-    {"continue", "openai_strict"},
     {"openai", "openai_strict"},
     {"gemini", "gemini"},
     {"vscode", "vscode"},

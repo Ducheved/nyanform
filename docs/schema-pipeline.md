@@ -1,278 +1,230 @@
 # Schema pipeline
 
-Nyanform's schema compiler turns an arbitrary upstream JSON Schema (the
-`inputSchema` field of an MCP tool definition) into a canonical `Scroll`
-struct, then optionally projects that struct into a client-specific
-dialect. The pipeline is pure functional data transformation: no GenServer,
-no side effects, no global state. Every stage is independently testable and
-the whole thing is idempotent.
+Nyanform parses a tool's raw `inputSchema` into a canonical `Scroll`, marks
+recursive local references, and computes a deterministic digest. Projection to
+a client profile is a separate operation.
 
-This document describes the eight stages, the canonical `Scroll` struct,
-reference handling, idempotency, and the three transformation policies.
+The distinction is important: `Pipeline.compile/2` does not run an eight-stage
+parse-to-profile workflow, and a successful compile does not prove that a
+particular profile accepts the schema.
 
----
+## What `Pipeline.compile/2` actually runs
 
-## The eight stages
+The returned `stages` list contains exactly these four entries:
 
-The pipeline is orchestrated by `Nyanform.Schema.Pipeline.compile/2`. Stages
-1-4, 7, and 8 produce a canonical `Scroll` and a digest; stages 5 and 6
-(project and analyze) happen separately when a profile is applied.
+| Recorded stage | Implementation |
+|---|---|
+| `:parse` | `Parser.parse/4`; structural validation is inline. |
+| `:canonicalize` | `Canonicalizer.canonicalize/1`. |
+| `:references` | Pipeline-local recursive-reference marking. |
+| `:digest` | `Serializer.digest/1`, which performs serialization internally. |
 
-### 1. Parse
+The result contains the canonical `scroll`, its `digest`, an empty `omens`
+list, and timing entries. `:validate`, `:project`, `:analyze`, and `:serialize`
+exist in the stage type but are not emitted by the current orchestration.
 
-`Nyanform.Schema.Parser.parse/4` walks the raw JSON term recursively and
-builds a `Scroll` tree. For each node it chooses a `kind` based on the
-JSON Schema keywords present:
+Profile projection happens later through `Projector.project/3`, usually from
+`ToolGrimoire`, `inspect`, or `matrix`.
 
-- `$ref` → `:ref`
-- `const` → `:const`
-- `enum` → `:enum`
-- `oneOf` or `anyOf` → `:union`
-- `allOf` → `:intersection`
-- `type` (single value) → that primitive kind
-- `type` (array of types) → `:union` whose branches are the individual types
-- Otherwise: inferred from `properties`/`additionalProperties` (`:object`),
-  `items` (`:array`), or `:unknown`.
+## Parse and structural validation
 
-A JSON Schema of literal `true` parses to `:any`; `false` parses to
-`:never`, following draft-07 / 2020-12 semantics.
+The parser accepts a JSON object, literal `true`, literal `false`, or an already
+constructed `Scroll`:
 
-The parser carries a `depth` counter and rejects schemas deeper than
-`max_schema_depth` (default 64) with a `schema_depth_exceeded` error.
+- `true` becomes `:any`; `false` becomes `:never`.
+- `oneOf` wins over `anyOf`, which wins over `allOf` when more than one
+  combinator is present. A combinator wins over `$ref` and ordinary type/value
+  parsing.
+- `$ref` wins over ordinary type/value parsing when no combinator is selected.
+- A valid `type` decides the node kind. `const` and `enum` can still be
+  retained as constraints on that typed node.
+- With no type, `const` selects `:const`, then `enum` selects
+  `:enum`.
+- With no type, `properties` or `additionalProperties` infer `:object`, `items`
+  infers `:array`, and an otherwise untyped schema becomes `:unknown`.
+- A multi-value `type` array becomes a union and a single-value array becomes
+  that type. Unknown type names, non-string members, empty arrays, and duplicate
+  members are structural errors.
+- Boolean child schemas are retained. In particular, `items: false` becomes a
+  `:never` child and has a different digest from an array without `items`.
 
-### 2. Structural validation
+The 15 possible kinds are `:object`, `:array`, `:string`, `:integer`,
+`:number`, `:boolean`, `:null`, `:enum`, `:const`, `:union`, `:intersection`,
+`:ref`, `:any`, `:never`, and `:unknown`.
 
-Validation happens inline during parsing. The parser returns
-`Nyanform.Schema.ValidationError` for any of:
+Structural errors are `ValidationError` values with atom codes and paths. The
+parser checks such cases as an invalid root node or type, explicit `null` or an
+invalid shape for modeled keywords, empty or malformed combinator branches,
+invalid schema children, malformed `required`, invalid numeric/string
+constraint values, and the parser depth limit. Shape validation covers modeled
+siblings even when another type, `$ref`, or combinator wins dispatch. This is
+still not a complete JSON Schema metaschema validator; unmodeled keywords are
+handled later by profile projection.
 
-- `invalid_schema_node` — top-level node is not a map, `true`, or `false`.
-- `invalid_enum` — `enum` is present but not a list.
-- `missing_branches` / `invalid_branches` — `oneOf`/`anyOf`/`allOf` is
-  missing or not a list.
-- `invalid_property_map` — `properties` is not a map.
-- `invalid_additional_properties` — `additionalProperties` is not a map,
-  boolean, or absent.
+Every parsed schema node attaches `$defs`, or legacy `definitions` when `$defs`
+is absent, to its own `scroll.definitions`. Each node retains its source map in
+`raw`.
 
-Each error carries the JSON path of the offending node, so downstream
-diagnostics can point precisely.
+## Canonicalization
 
-### 3. Canonicalization
+`Canonicalizer.canonicalize/1` recursively normalizes schema children and
+definitions. In current code it:
 
-`Nyanform.Schema.Canonicalizer.canonicalize/1` walks the parsed tree and
-applies normalization rules so two equivalent source schemas produce the
-same canonical form:
+- deduplicates and sorts each `required` list;
+- replaces empty property, pattern-property, and definition maps with `nil`;
+- canonicalizes properties, pattern properties, array items, branches,
+  additional-property schemas, and definitions;
+- removes unrecognized string `format` values.
 
-- `required` arrays are deduplicated (`Enum.uniq/1`).
-- Empty property maps become `nil` (so `{}` and a missing `properties` are
-  indistinguishable after canonicalization).
-- String `format` values that are not in Nyanform's supported set are
-  dropped. Supported formats: `date-time`, `date`, `time`, `duration`,
-  `email`, `idn-email`, `hostname`, `idn-hostname`, `ipv4`, `ipv6`, `uri`,
-  `uri-reference`, `iri`, `uuid`. Anything else is considered
-  `:unsupported` and the `format` field is set to `nil`.
-- Recursion is detected and marked (see stage 4).
+Supported string formats are `date-time`, `date`, `time`, `duration`, `email`,
+`idn-email`, `hostname`, `idn-hostname`, `ipv4`, `ipv6`, `uri`,
+`uri-reference`, `iri`, and `uuid`.
 
-### 4. Reference analysis
+The unsupported-format removal is currently silent: `Pipeline.compile/2`
+returns no omen for it. A later `NYA-PROFILE-003` applies when a retained
+canonical format is removed because the selected profile rejects the `format`
+keyword or that concrete format value.
 
-`Nyanform.Schema.Reference` resolves `$ref` against `$defs` and the legacy
-`definitions` map. Reference targets are stored as path lists (e.g.
-`["Foo", "bar"]` for `#/$defs/Foo/bar`); local vs. external references are
-distinguished by whether the joined target string contains a `:`.
+Canonicalization does not sort branch order, tuple-item order, or enum values.
+Those lists retain their semantic source order.
 
-Cycle detection: `detect_cycles/2` walks the ref graph with a `seen`
-MapSet; if it returns `true`, the pipeline calls `mark_recursive/5`, which
-propagates a `recursive: true` flag down through properties, items,
-branches, and additional-properties, bounded by `max_reference_depth`
-(default 32). Recursive references are kept as `:ref` nodes in the
-canonical form — they are not inlined, because inlining would either loop
-forever or lose information.
+## Reference handling
 
-If a reference chain exceeds `max_reference_depth` without cycling, the
-resolver returns `reference_depth_exceeded`.
+References are represented by `%Reference{uri, fragment}`. A reference is
+local exactly when `uri == ""`; this is not inferred from punctuation in the
+original string.
 
-### 5. Profile projection
+The pipeline's `:references` operation is narrower than the public
+`Reference` module:
 
-`Nyanform.Profile.Projector.project/3` takes a canonical `Scroll` and a
-`Constellation` (compatibility profile) and produces a projected
-JSON-Schema-shaped map suitable for that profile's client. This is where
-profile-specific transformations happen:
+- It follows only local JSON Pointer references whose first path segment is
+  `$defs` or `definitions` and whose definition name exists at the root.
+- It follows them only to decide whether the original `:ref` node should have
+  `recursive: true`.
+- It does not inline targets, reject unresolved references, or reject external
+  references.
+- Reaching `max_reference_depth` marks the reference recursive instead of
+  returning an error.
 
-- Objects emit `type: object` plus `properties`, `required`, and
-  (conditionally) `additionalProperties: false`.
-- Numbers emit `number` or `integer` depending on
-  `integer_vs_number_distinguished`.
-- Consts become `const` (if `supports_const`) or a single-value `enum`
-  (otherwise).
-- Unions become `oneOf`/`anyOf` if the profile supports them, collapse to
-  a nullable single type when nullable, or are rejected.
-- Intersections become `allOf` if supported, or are merged into a single
-  object schema via property intersection (with conflict detection).
-- `$ref` is preserved if the profile supports it (full or local-only), or
-  rejected.
-- Tuple arrays, untyped arrays, mixed-type enums, and empty enums are
-  handled per the profile's `supported_array_forms` and
-  `supported_enum_forms`.
-- Descriptions are truncated to `max_description_length`.
+`Reference.resolve/2` and `Reference.detect_cycles/2` are public helpers with
+their own behavior, but `Pipeline.compile/2` does not call them. In particular,
+the catalog entry `NYA-SCHEMA-011` is not a statement that the live pipeline
+rejects cycles; the pipeline preserves and marks recursive local references.
 
-See [compatibility-profiles.md](compatibility-profiles.md) for the per-
-profile matrix.
+Profile projection later decides whether a preserved reference is supported:
+`:full` accepts any URI, `:local_only` accepts only `uri == ""`, and `:none`
+rejects references. Projection also rejects local JSON Pointer references whose
+targets do not exist in the source document within the `max_schema_depth`
+traversal boundary. Recursive references remain valid; external URI and anchor
+references are outside that target-existence check, and deeper targets are left
+unclassified when the bounded walker stops.
 
-### 6. Loss analysis
+## Deterministic serialization and digest
 
-Every transformation during projection emits an `Omen` with a severity:
+`Serializer.to_canonical_term/1` recursively removes descriptive/source fields
+from every `Scroll` node:
 
-- `:exact` — no transformation; the construct passes through unchanged.
-- `:normalized` — a reversible or semantics-preserving rewrite (e.g. all
-  properties marked required, name sanitized, description truncated).
-- `:lossy` — information was dropped (e.g. `additionalProperties: false`
-  dropped, `format` keyword dropped, const demoted to enum).
-- `:rejected` — the construct cannot be represented at all (e.g. union
-  unsupported, mixed-type enum, tuple array unsupported, reference
-  unsupported).
+- `description`
+- `title`
+- `default`
+- `examples`
+- `raw`
+- `path`
 
-The four severities form a total order
-(`exact < normalized < lossy < rejected`); `Omen.worst/1` returns the most
-severe in a list. See [diagnostics.md](diagnostics.md).
+It preserves annotations, node kinds, structural children, constraints,
+references, and recursion markers. Struct fields and named child maps are
+sorted by key. Semantic lists such as union branches, tuple items, and enum
+values are kept in order; `required` has already been sorted by the
+canonicalizer.
 
-### 7. Deterministic serialization
+`Serializer.serialize/1` performs:
 
-`Nyanform.Schema.Serializer.to_canonical_term/1` strips fields that are
-not part of the schema's semantic content:
-
-- `description`, `title`, `default`, `examples`, `raw`, `path` — all set to
-  `nil` / `:unset` / `[]`.
-
-It then builds a keyword list of the remaining fields, recursively
-canonicalizing nested scrolls, sorting map keys alphabetically and list
-entries by their canonical representation. The resulting Erlang term is
-byte-stable: two scrolls that are semantically equal produce identical
-terms.
-
-### 8. Digest calculation
-
-`Serializer.digest/1` runs
-`:crypto.hash(:sha256, serialize(scroll)) |> Base.encode16(case: :lower)`.
-The digest is the canonical fingerprint:
-
-- `nyanform snapshot` records per-tool digests.
-- `nyanform check` compares stored and live digests to detect breaking
-  schema changes.
-- The check command classifies changes as `breaking`,
-  `potentially_breaking`, `metadata_only` (only the description changed),
-  or `compatible` (tool added) based on digest equality.
-
----
-
-## The canonical `Scroll` struct
-
-`Nyanform.Schema.Scroll` is a plain Elixir struct with 34 fields. Each
-field maps to a JSON Schema concept; absent values use `nil` (or `:unset`
-for `default`/`const`, distinguishing "unset" from "explicitly null").
-
-The 15 kinds:
-
-| Kind | Source | Meaning |
-|------|--------|---------|
-| `:object` | `type: object` or presence of `properties`/`additionalProperties` | JSON object with properties, required, pattern properties, additional properties, min/max properties. |
-| `:array` | `type: array` or presence of `items` | JSON array with homogeneous items, tuple items, additional items, min/max items, uniqueness. |
-| `:string` | `type: string` | String with optional format, pattern, min/max length. |
-| `:integer` | `type: integer` | Integer with numeric constraints. |
-| `:number` | `type: number` | Number with numeric constraints. |
-| `:boolean` | `type: boolean` | Boolean. |
-| `:null` | `type: null` | JSON null. |
-| `:enum` | `enum: [...]` | Closed set of allowed values. |
-| `:const` | `const: <value>` | Single allowed value. |
-| `:union` | `oneOf` / `anyOf` / array-of-types | Disjunction of branches. |
-| `:intersection` | `allOf` | Conjunction of branches. |
-| `:ref` | `$ref` | Reference to a definition. |
-| `:any` | `true` / omitted type | Accepts anything. |
-| `:never` | `false` | Accepts nothing. |
-| `:unknown` | unrecognized type string | Schema Nyanform could not classify; raw is preserved. |
-
-Helper predicates: `Scroll.object?/1`, `Scroll.ref?/1`,
-`Scroll.primitive?/1`. Constructors: `Scroll.any/1`, `Scroll.never/1`.
-
----
-
-## Reference resolution and cycle detection
-
-`$ref` handling is split between the parser, the canonicalizer, and the
-reference module:
-
-1. **Parsing.** `Parser.parse_ref/4` extracts the `$ref` string, splits it
-   into a path list (`split_ref/1` handles `#/foo/bar`,
-   `#/`, bare URIs, and `uri#/fragment` forms), and stores the result as a
-   `:ref` node with `ref_target` set to the path list.
-2. **Definition extraction.** `Pipeline.resolve_definitions/3` pulls
-   `$defs` (and the legacy `definitions`) from the raw map, parses each
-   definition (bounded by `max_schema_depth`), and indexes them by path.
-3. **Cycle detection.** `Reference.detect_cycles/2` walks the tree; if a
-   ref target has been seen on the current path, it returns `true`.
-4. **Marking.** `Pipeline.mark_recursive/5` propagates the `recursive`
-   flag through the tree, bounded by `max_reference_depth`, so the
-   serializer and projector can avoid infinite expansion.
-5. **Resolution.** `Reference.resolve/2` is available for callers that
-   want to inline non-recursive references; it returns the resolved
-   scroll or marks recursion.
-
-Recursive refs are preserved as `:ref` nodes in the canonical form. The
-projector emits them as `$ref` strings for profiles that support
-references; for profiles that do not, it emits a rejection omen.
-
----
-
-## Idempotency guarantees
-
-`Pipeline.compile_idempotent/1` runs the pipeline twice and asserts the
-two digests are equal:
-
-```
-raw_schema
-   │ compile
-   ▼
-first.scroll ─── first.digest
-   │ compile   (on the struct, not the raw input)
-   ▼
-second.scroll ── second.digest
+```text
+canonical term -> :erlang.term_to_binary -> lowercase hexadecimal string
 ```
 
-If `first.digest != second.digest`, the pipeline returns
-`idempotency_violation`. This catches any non-idempotent transformation —
-for example, a canonicalizer step that mutates the struct in a way that
-survives a second pass.
+`Serializer.digest/1` hashes that hexadecimal string with SHA-256 and returns a
+64-character lowercase hexadecimal digest.
 
-The guarantee holds because:
+Consequences of the current digest boundary:
 
-- The canonicalizer is a pure tree rewrite with no mutable state.
-- The serializer strips `path`, `raw`, and other non-semantic fields
-  before computing the digest, so re-parsing a struct does not introduce
-  path drift.
-- Map keys are sorted, list entries are processed in order.
+- nested descriptive metadata does not affect the digest;
+- ordering of `required`, properties, and definitions does not affect it;
+- branch, tuple-item, and enum ordering can affect it;
+- annotations and semantic constraints affect it;
+- digest equality is a deterministic equality check for Nyanform's canonical
+  representation, not a proof of general JSON Schema semantic equivalence.
 
-Property tests in `test/nyanform/schema/property_test.exs` exercise this
-on generated schemas.
+`Pipeline.compile_idempotent/1` compiles the raw value, compiles the resulting
+`Scroll`, and compares the two digests. A mismatch returns
+`idempotency_violation`.
 
----
+## Projection is separate
 
-## The three transformation policies
+For ordinary profiles, `Projector.project/3` recursively reconstructs a JSON
+Schema-shaped map from the canonical `Scroll`, collects profile omens, and
+calculates acceptance for the selected policy.
 
-The policy is a parameter to `Projector.project/3` and to
-`ToolGrimoire.build/3`. It controls how aggressively the projector rewrites
-and which severities cause a tool to be rejected.
+Definitions are projected at the schema node that owns them. They are emitted
+as `$defs`; local JSON Pointer references that used a legacy `definitions`
+segment are rewritten against the final projected schema so nested pointers do
+not dangle.
 
-| Policy | `:exact` | `:normalized` | `:lossy` | `:rejected` | Accepts |
-|--------|----------|---------------|----------|-------------|---------|
-| `:strict` (default) | accept | accept | **reject** | **reject** | only fully-compatible schemas |
-| `:compatible` | accept | accept | accept | **reject** | anything that can be represented |
-| `:permissive` | accept | accept | accept | accept | everything, even rejected constructs |
+Two profiles define the output boundary explicitly:
 
-`policy_accepts?/2` in both `Projector` and `ToolGrimoire` implements this
-table. The matrix command and the proxy both consult it when deciding
-whether to mark a tool as accepted.
+- `canonical` is a normalized reconstruction for modeled schemas. An
+  `:unknown` `Scroll` uses its retained raw schema as a fallback, and boolean
+  schemas remain boolean values. Retained unmodeled keywords such as
+  `prefixItems`, `$id`, and `$schema` emit rejected `NYA-PROFILE-012` rather
+  than disappearing silently.
+- `passthrough` is a projector special case that returns the retained raw
+  schema, using `%{}` only when `scroll.raw` is `nil`. It still reports dangling
+  local JSON Pointer references found within the bounded traversal. It does not
+  bypass tool compilation, aliases, tool-definition reconstruction, or
+  transport re-encoding.
 
-Strict is the safe default for production: it surfaces every lossy or
-rejected construct as a failure, so silent information loss cannot slip
-through. Compatible is appropriate when you know the client can tolerate
-some normalization but want hard failures on genuinely unsupported
-constructs. Permissive is for diagnostic and exploratory use: it lets you
-see the projected schema even when it would normally be rejected.
+The projector emits diagnostics for selected rewrites such as unsupported
+keywords, constraints, combinators, references, array/enum forms, required
+closed objects, and profile depth. Every normalized profile rejects retained
+unmodeled annotations except internal combinator metadata and configured vendor
+extensions. It does not retroactively report canonicalizer changes such as an
+unknown format already removed before projection.
+
+## Policies and live enforcement
+
+| Policy | `exact` | `normalized` | `lossy` | `rejected` |
+|---|---:|---:|---:|---:|
+| `strict` | accept | accept | reject | reject |
+| `compatible` | accept | accept | accept | reject |
+| `permissive` | accept | accept | accept | accept |
+
+Dangling local JSON Pointer targets keep the projection unaccepted under every
+policy. An undeclared required name does the same only for profiles that replace
+`required` with the complete `properties` key set; canonical and passthrough
+preserve that valid JSON Schema constraint. The live `permissive` catalog can
+still publish rejected entries as described in the compatibility profile
+documentation.
+
+`Projector` calculates acceptance from its omens. `ToolGrimoire` then combines
+projection omens with compilation and alias omens and applies the policy again.
+The proxy exposes only accepted tools unless policy is `permissive`, and only
+structurally publishable exposed/permissive tools receive callable aliases.
+Malformed tool envelopes and non-list catalog values are never made callable.
+
+## Snapshot and check semantics
+
+`nyanform snapshot` stores per-tool schema digests. `nyanform check` currently
+classifies changes as follows:
+
+| Observed change | Classification |
+|---|---|
+| live tool added | `compatible` |
+| stored tool removed | `breaking` |
+| the input/output comparisons match, but the top-level tool description changed and the input schemas compare equal without their root description | `metadata_only` |
+| both input digests are available and either the input or output comparison differs | `breaking` |
+| at least one input digest is unavailable and the input/output comparisons do not both match | `potentially_breaking` |
+
+Because the digest recursively strips descriptive metadata, a nested
+description-only edit can compare as no change rather than `metadata_only`.
+The `metadata_only` label is specifically reached through the top-level tool
+description check; it is not a general schema-diff engine.

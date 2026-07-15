@@ -16,6 +16,10 @@ it unblock? If you have a concrete example (a schema that currently fails
 to project, a client that is not yet detected, a transport that is not
 supported), describe it here.
 
+For a client/profile compatibility request, include current primary vendor
+documentation or a reproducible client observation when available. Clearly
+separate documented vendor behavior from an inferred compatibility heuristic.
+
 ## Current behavior
 
 What Nyanform does today. If applicable, paste the relevant diagnostic
@@ -38,3 +42,6 @@ Any other approaches you considered, and why they did not work.
 
 Links to MCP specification sections, client documentation, or related
 issues.
+
+Do not include credentials, private schemas, or exploitable vulnerability
+details in a public feature request.

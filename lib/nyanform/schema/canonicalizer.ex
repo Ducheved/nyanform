@@ -147,7 +147,10 @@ defmodule Nyanform.Schema.Canonicalizer do
   end
 
   defp normalize_required(nil, _properties), do: nil
-  defp normalize_required(required, _properties) when is_list(required), do: Enum.uniq(required)
+
+  defp normalize_required(required, _properties) when is_list(required) do
+    required |> Enum.uniq() |> Enum.sort()
+  end
 
   defp maybe_nilify(map) when map_size(map) == 0, do: nil
   defp maybe_nilify(map), do: map

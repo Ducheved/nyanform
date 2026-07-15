@@ -1,61 +1,57 @@
-# Nyanform — Build Plan
+# Nyanform build status
 
-Status: complete — all quality gates pass.
+Status: the implementation is assembled in the repository and remains
+unreleased. A quality result belongs to a specific commit and CI run; this file
+does not freeze a test count or claim that the current worktree has passed every
+gate.
 
 ## Goal
 
-One MCP server works everywhere. A local-first proxy + schema compiler that
-sits between an MCP client and an MCP server, compiles upstream tool schemas
-into a canonical representation, and projects a compatible dialect per client.
+Nyanform inspects and adapts MCP tool schemas through a local-first proxy and
+schema compiler. It sits between an MCP client and an MCP server, builds a
+canonical representation of upstream tool schemas, and projects a selected
+compatibility dialect while reporting detected loss.
 
-## Architecture decisions
+## Architecture decisions represented in code
 
-* Proxy/interceptor role requires transparent JSON-RPC passthrough. The
-  high-level SDK DSLs (hermes_mcp `Server`/`Client` macros) are opinionated
-  toward concrete tool registration and fight the interceptor pattern.
-* Nyanform owns a thin, focused JSON-RPC 2.0 + MCP lifecycle layer over the
-  standard library plus transport libs (Bandit/Plug downstream HTTP, Req
-  upstream HTTP, Erlang ports for stdio). Rationale in `docs/architecture.md`.
-* Schema compilation is pure data: no GenServer wrapping pure functions.
+- The proxy owns a focused JSON-RPC 2.0 and MCP lifecycle layer so methods that
+  Nyanform does not intercept can pass through without being modeled as local
+  tools.
+- Bandit and Plug provide downstream HTTP, Req provides upstream HTTP, and
+  Erlang ports provide upstream stdio without a shell.
+- Schema compilation and projection are data transformations. Processes are
+  used for application supervision, sessions, transports, and concurrent
+  matrix work.
+- Compatibility profiles are declarative Nyanform policy. They must be kept
+  separate from claims about official vendor support.
 
-## Vertical slices (all complete)
+## Implemented workstreams
 
-1. [scaffold] mix project, config, formatter, application
-2. [compiler] canonical schema representation + parser + canonicalizer + refs + digest
-3. [profiles] compatibility profiles as declarative data + projection
-4. [diagnostics] omens + report renderers (terminal/JSON/JUnit/SARIF)
-5. [cli] inspect/matrix/snapshot/check/doctor/serve
-6. [protocol] JSON-RPC framing + MCP lifecycle
-7. [transports] stdio + Streamable HTTP, downstream + upstream
-8. [catalog] tool grimoire (alias mapping) + argument repair talisman
-9. [serve] serve command + client familiar (profile detection)
-10. [fixtures] deterministic fixture servers/clients + golden outputs
-11. [quality] no-comments checker + aliases
-12. [tests] canonicalization/profile/property/args/protocol/transports/CLI
-13. [docs] README + docs/* + repo deliverables
-14. [release] release + Dockerfile + GitHub Actions
-15. [validate] final end-to-end suite
+- Mix application scaffold, supervision, configuration, and limits.
+- Canonical schema representation, parser, canonicalizer, local-reference
+  analysis, serializer, and digest.
+- Built-in profiles, profile overrides, projection, and structured diagnostics.
+- Terminal, JSON, JUnit, and SARIF reporting.
+- `serve`, `inspect`, `matrix`, `snapshot`, `check`, and `doctor` commands.
+- MCP lifecycle and JSON-RPC framing over stdio and HTTP transports.
+- Session management, paginated tool catalogs with stable cross-page aliases,
+  argument repair, and client profile detection.
+- Unit, property, transport, session, CLI, and quality-gate tests.
+- Escript and Docker builds plus GitHub Actions checks.
 
-## Quality results
+## Release readiness checks
 
-- format: PASS
-- compile --warnings-as-errors: PASS
-- no-comments checker: PASS (0 violations)
-- credo --strict: PASS (0 failures)
-- dialyzer: PASS (documented false positives suppressed)
-- tests: 118 passed (6 properties, 112 tests)
-- release: built (40 MB tar.gz)
+Before publishing a first version, verify the exact commit rather than relying
+on this status document:
 
-## Test categories
+1. Run `mix ci`.
+2. Build the escript and run the fixture-backed CLI and stdio proxy smoke tests.
+3. Build the Docker image and run its `--help` smoke test.
+4. Review built-in profile assumptions against current client behavior and
+   clearly label any behavior that is not backed by official documentation.
+5. Review generated snapshots and reports for sensitive raw schema metadata.
+6. Publish a tag and release only after the intended artifact has been tested.
 
-- Canonicalization: 15 tests
-- Profile projection: 22 tests
-- Property-based: 6 properties
-- Arguments/repair: 13 tests
-- Protocol messages: 11 tests
-- Client familiar: 9 tests
-- Tool grimoire: 7 tests
-- Report rendering: 10 tests
-- No-comments checker: 7 tests
-- Stdio proxy integration: 6 tests
-- CLI integration: 14 tests
+The repository CI performs these checks in separate jobs where applicable.
+Repository branch rules, release publication, and private security intake are
+hosting settings and are not guaranteed by the files in this repository.

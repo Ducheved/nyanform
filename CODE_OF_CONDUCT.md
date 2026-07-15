@@ -58,14 +58,19 @@ representative at an online or offline event.
 
 ## Enforcement
 
-Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the community leaders responsible for enforcement at
-**conduct@ducheved.dev**.
+This repository does not currently publish a verified private conduct mailbox
+or a response-time commitment. Do not put personal information or sensitive
+incident details in a public issue.
 
-All complaints will be reviewed and investigated promptly and fairly.
+Use GitHub's built-in content and abuse reporting or blocking controls when
+they apply. For repository-specific moderation, contact a maintainer through a
+verified GitHub channel first and ask how to provide sensitive details
+privately. If no private channel is available, retain those details rather than
+publishing them.
 
-All community leaders are obligated to respect the privacy and security of the
-reporter of any incident.
+Maintainers will handle reports on a best-effort basis and should disclose
+report details only as needed for moderation. This statement does not promise a
+particular response time, investigation process, or outcome.
 
 ## Enforcement Guidelines
 

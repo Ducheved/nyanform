@@ -1,162 +1,159 @@
 # Diagnostics
 
-Nyanform records every transformation it applies to a schema as a
-structured diagnostic called an **omen**. Omens are the primary output of
-`nyanform inspect` and `nyanform matrix`, and they flow through every
-report renderer (terminal, JSON, JUnit, SARIF).
+An `Omen` is Nyanform's structured diagnostic for a selected rewrite,
+rejection, alias decision, or argument repair. The code catalog is broader than
+the current set of runtime emitters.
 
-This document lists every diagnostic code, the four severity levels, and
-the structure of an omen.
+Three cautions keep the output interpretable:
 
----
+- Absence of omens does not mean byte-for-byte preservation. For example, the
+  canonicalizer silently drops an unknown string format.
+- `Pipeline.compile/2` currently returns `omens: []`; parser failures are
+  `ValidationError` values and are usually collapsed to `NYA-SCHEMA-001` by
+  callers.
+- A catalog entry describes an available code and its default severity. It does
+  not prove that a live code path currently emits it.
 
 ## Severity levels
 
-Every omen has one of four severities, ordered from least to most severe:
+| Severity | Order | `semantics_preserved` | Runtime policy meaning |
+|---|---:|---:|---|
+| `exact` | 0 | `true` | An emitted diagnostic says the examined construct was retained. Unchanged constructs do not necessarily emit one. |
+| `normalized` | 1 | `true` | Nyanform classifies the rewrite as schema-semantics-preserving, such as const to a single-value enum or deterministic name repair. |
+| `lossy` | 2 | `false` | Some constraint or information was dropped or relaxed. |
+| `rejected` | 3 | `false` | The construct cannot be represented under the intended rule. |
 
-| Severity | Order | Semantics preserved | Meaning |
-|----------|-------|---------------------|---------|
-| `:exact` | 0 | yes | The construct passed through unchanged. No information was added or lost. |
-| `:normalized` | 1 | yes | A reversible or semantics-preserving rewrite was applied (e.g. all properties marked required, name sanitized, description truncated, JSON-string argument repaired). The schema's meaning is unchanged. |
-| `:lossy` | 2 | **no** | Information was dropped (e.g. `additionalProperties: false` removed, `format` keyword dropped, `const` demoted to single-value `enum`). The schema is more permissive than the original. |
-| `:rejected` | 3 | **no** | The construct cannot be represented in the target profile at all (e.g. union unsupported, mixed-type enum, tuple array unsupported, reference unsupported). |
+`Omen.severity_order/1` defines the ordering and `Omen.worst/1` returns the
+worst severity in a list. The ordinary severity gate works as follows: `strict`
+rejects `lossy` and `rejected`; `compatible` rejects only `rejected`;
+`permissive` admits every severity. Projector integrity checks for dangling
+local pointers and required-name loss can still keep `accepted` false. The live
+permissive catalog may publish a rejected schema only when its tool envelope is
+structurally publishable.
 
-`Nyanform.Diagnostic.Omen.severity_order/1` returns the numeric ordering;
-`Omen.worst/1` returns the most severe severity in a list. The policy
-(`strict` / `compatible` / `permissive`) decides which severities cause a
-tool to be marked as not accepted.
+## Omen fields
 
----
+`Nyanform.Diagnostic.Omen` contains:
 
-## Omen structure
+| Field | Meaning |
+|---|---|
+| `code` | Stable `NYA-*` identifier. |
+| `severity` | `exact`, `normalized`, `lossy`, or `rejected`. |
+| `schema_path` | String path segments for the affected schema node. |
+| `rule` | Optional machine-oriented rule name. |
+| `source` / `target` | Optional before/after descriptions. |
+| `semantics_preserved` | Set by the severity constructor. |
+| `explanation` | Human-readable reason. |
+| `action` | Optional remediation text. |
+| `tool` / `profile` | Optional context added by tool/profile reporting paths. |
 
-`Nyanform.Diagnostic.Omen` is a struct with these fields:
+The four constructors (`exact/2`, `normalized/2`, `lossy/2`, and `rejected/2`)
+set `semantics_preserved` from severity.
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `code` | `String.t()` | The `NYA-*` diagnostic code. |
-| `severity` | `:exact` \| `:normalized` \| `:lossy` \| `:rejected` | Severity level. |
-| `schema_path` | `[String.t()]` | JSON path of the offending node (e.g. `["properties", "user", "items"]`). |
-| `rule` | `String.t()` \| `nil` | Short machine-readable rule name (e.g. `mixed_enum_unsupported`). |
-| `source` | `String.t()` \| `nil` | What the construct was before transformation. |
-| `target` | `String.t()` \| `nil` | What the construct became. `nil` for rejections (nothing was produced). |
-| `semantics_preserved` | `boolean()` | `true` for `:exact` and `:normalized`; `false` otherwise. |
-| `explanation` | `String.t()` | Human-readable prose. |
-| `action` | `String.t()` \| `nil` | Optional suggested fix. Populated for rejections. |
-| `tool` | `String.t()` \| `nil` | Tool name. Populated by the matrix command. |
-| `profile` | `String.t()` \| `nil` | Profile name. Populated by the matrix command. |
+## Code catalog
 
-Omens are constructed via the four severity constructors
-(`Omen.exact/2`, `Omen.normalized/2`, `Omen.lossy/2`, `Omen.rejected/2`),
-which set `semantics_preserved` automatically.
+The severity below is the catalog default from `Diagnostic.Codes`. Some
+projector branches deliberately emit the same code at another severity based on
+policy. Examples include empty enums, unsupported `allOf`, and required closed
+objects.
 
----
+### Schema
 
-## Diagnostic codes by category
+| Code | Default | Catalog summary | Current emission status |
+|---|---|---|---|
+| `NYA-SCHEMA-001` | rejected | schema failed structural validation | `ToolGrimoire`, `inspect`, and `matrix` wrap compile failures with this general code. |
+| `NYA-SCHEMA-002` | lossy | nullable type array normalized | Catalog only; no current emitter. |
+| `NYA-SCHEMA-003` | lossy | `additionalProperties: false` dropped | Projector when a profile cannot preserve it. |
+| `NYA-SCHEMA-004` | lossy | empty enum dropped | Projector; strict can emit it as rejected. |
+| `NYA-SCHEMA-005` | rejected | mixed-type enum unsupported | Projector. |
+| `NYA-SCHEMA-006` | rejected | tuple-style array unsupported | Projector; non-strict fallback may be lossy. |
+| `NYA-SCHEMA-007` | rejected | union unsupported by profile | Projector. |
+| `NYA-SCHEMA-008` | rejected | contradictory intersection | Projector while attempting `allOf` merge. |
+| `NYA-SCHEMA-009` | rejected | array without items unsupported | Projector; exact when the profile accepts untyped arrays, otherwise rejected. `permissive` can still publish the rejected tool. |
+| `NYA-SCHEMA-010` | rejected | schema depth exceeded | Catalog only. Parser depth errors remain atom-coded validation errors and are not mapped to this omen. |
+| `NYA-SCHEMA-011` | rejected | reference cycle detected | Catalog only. The live pipeline marks recursive local refs instead of rejecting them. |
+| `NYA-SCHEMA-012` | lossy | schema definitions dropped | Projector path for a profile with `reference_support: :none`; no current built-in profile selects that mode. |
+| `NYA-SCHEMA-013` | rejected | required property is not declared | Projector when a profile must replace `required` with the complete `properties` key set and that rewrite would drop an undeclared required name. Canonical and passthrough preserve such names. |
+| `NYA-SCHEMA-014` | rejected | local reference target is missing | Projector when a local JSON Pointer `$ref` does not resolve within the `max_schema_depth` source traversal. External URI, anchors, and targets below the traversal boundary are not classified by this check. |
 
-All codes are catalogued in `Nyanform.Diagnostic.Codes`. Use
-`Codes.fetch/1` to look up a code's category, default severity, and
-summary; `Codes.all/0` returns the full map; `Codes.categories/0` returns
-the distinct categories.
+### Profile
 
-### Schema (NYA-SCHEMA-001 — NYA-SCHEMA-011)
+| Code | Default | Catalog summary | Current emission status |
+|---|---|---|---|
+| `NYA-PROFILE-001` | normalized | all properties marked required | Projector, notably `openai_strict`. |
+| `NYA-PROFILE-002` | normalized | number type preserved without integer distinction | Emitter exists; no built-in currently disables integer/number distinction. |
+| `NYA-PROFILE-003` | lossy | format keyword dropped | Projector when the format keyword or its concrete value is not accepted by the profile. |
+| `NYA-PROFILE-004` | rejected | reference unsupported by profile | Projector. |
+| `NYA-PROFILE-005` | lossy | pattern properties dropped | Projector. |
+| `NYA-PROFILE-006` | normalized | const converted to single-value enum | Projector for `gemini` and `openai_strict`; strict policy accepts this normalized rewrite. |
+| `NYA-PROFILE-007` | normalized | description truncated | Emitter exists; all built-ins currently use an unlimited description length. |
+| `NYA-PROFILE-008` | rejected | root object required | Projector, currently used by `openai_strict`. |
+| `NYA-PROFILE-009` | rejected | profile nesting limit exceeded | Projector, currently used for `openai_strict` object depth 10. |
+| `NYA-PROFILE-010` | rejected | `allOf` unsupported by profile | Projector; strict rejects it, non-strict policies try a lossy merge. |
+| `NYA-PROFILE-011` | lossy | closed object required by profile | Projector; schema-valued `additionalProperties` can instead be rejected or replaced lossily. |
+| `NYA-PROFILE-012` | lossy | unsupported schema keyword dropped | Projector recursively removes selected scalar constraints and metadata outside the profile allowlist. Every normalized profile emits this code as rejected for retained unmodeled keywords such as `prefixItems`, `$id`, and `$schema`; vendor profiles also reject boolean schemas with it. |
 
-Emitted during parsing, canonicalization, and projection when the schema
-itself contains a construct that the pipeline cannot faithfully handle.
+`NYA-PROFILE-012` currently covers `title`, `default`, `examples`,
+`minProperties`, `maxProperties`, `minItems`, `maxItems`, `uniqueItems`,
+`pattern`, `minLength`, `maxLength`, `minimum`, `maximum`,
+`exclusiveMinimum`, `exclusiveMaximum`, and `multipleOf` when present but not
+accepted by the profile. Retained unmodeled annotations use the same code as
+rejected, except internal `nya:combinator` metadata and configured vendor
+extensions. `format`, `patternProperties`, combinators, and definitions have
+their own codes.
 
-| Code | Severity | Summary |
-|------|----------|---------|
-| `NYA-SCHEMA-001` | rejected | schema failed structural validation |
-| `NYA-SCHEMA-002` | lossy | nullable type array normalized |
-| `NYA-SCHEMA-003` | lossy | additionalProperties: false dropped |
-| `NYA-SCHEMA-004` | lossy | empty enum dropped |
-| `NYA-SCHEMA-005` | rejected | mixed-type enum unsupported |
-| `NYA-SCHEMA-006` | rejected | tuple-style array unsupported |
-| `NYA-SCHEMA-007` | rejected | union unsupported by profile |
-| `NYA-SCHEMA-008` | rejected | contradictory intersection |
-| `NYA-SCHEMA-009` | rejected | array without items unsupported |
-| `NYA-SCHEMA-010` | rejected | schema depth exceeded |
-| `NYA-SCHEMA-011` | rejected | reference cycle detected |
+### Alias
 
-### Profile (NYA-PROFILE-001 — NYA-PROFILE-007)
+| Code | Default | Catalog summary | Current emission status |
+|---|---|---|---|
+| `NYA-ALIAS-001` | normalized | tool name sanitized | `ToolGrimoire`. |
+| `NYA-ALIAS-002` | normalized | collision suffix added | `ToolGrimoire`. |
+| `NYA-ALIAS-003` | rejected | ambiguous alias mapping | Catalog only; current collision handling creates deterministic unique suffixes. |
 
-Emitted during projection when a profile-specific transformation is
-applied.
+### Transport
 
-| Code | Severity | Summary |
-|------|----------|---------|
-| `NYA-PROFILE-001` | normalized | all properties marked required |
-| `NYA-PROFILE-002` | normalized | number type preserved without integer distinction |
-| `NYA-PROFILE-003` | lossy | format keyword dropped |
-| `NYA-PROFILE-004` | rejected | reference unsupported by profile |
-| `NYA-PROFILE-005` | lossy | pattern properties dropped |
-| `NYA-PROFILE-006` | rejected | const unsupported by profile |
-| `NYA-PROFILE-007` | normalized | description truncated |
+| Code | Default | Catalog summary | Current emission status |
+|---|---|---|---|
+| `NYA-TRANSPORT-001` | rejected | message size exceeded | Catalog only as an `Omen`; transport returns ordinary errors. |
+| `NYA-TRANSPORT-002` | rejected | malformed JSON-RPC frame | Catalog only as an `Omen`; parser returns an ordinary parse error. |
+| `NYA-TRANSPORT-003` | rejected | request timeout | Catalog only as an `Omen`. |
+| `NYA-TRANSPORT-004` | rejected | upstream process failure | Used as a CLI error label, not constructed as an `Omen`. |
+| `NYA-TRANSPORT-005` | normalized | stdout protocol purity enforced | Catalog only. |
+| `NYA-TRANSPORT-006` | rejected | session isolation violation | Used as a CLI HTTP-start error label, not constructed as an `Omen`. |
 
-### Alias (NYA-ALIAS-001 — NYA-ALIAS-003)
+### Argument
 
-Emitted by `Nyanform.ToolGrimoire` when a tool name must be rewritten to
-satisfy a profile's `tool_name_pattern`.
+| Code | Default | Catalog summary | Current emission status |
+|---|---|---|---|
+| `NYA-ARG-001` | normalized | JSON string repaired to object | `RewriteTalisman`. |
+| `NYA-ARG-002` | normalized | JSON string repaired to array | `RewriteTalisman`. |
+| `NYA-ARG-003` | rejected | argument repair rejected | Catalog only. |
+| `NYA-ARG-004` | normalized | synthetic optional null removed | `RewriteTalisman` removes a `null` introduced only to represent an originally optional, non-nullable OpenAI property. |
 
-| Code | Severity | Summary |
-|------|----------|---------|
-| `NYA-ALIAS-001` | normalized | tool name sanitized |
-| `NYA-ALIAS-002` | normalized | collision suffix added |
-| `NYA-ALIAS-003` | rejected | ambiguous alias mapping |
+The live `Session.Thread` forwards `repair_result.arguments` but currently
+discards `repair_result.omens`. These codes are therefore observable to direct
+callers of `RewriteTalisman`, not in the downstream `tools/call` response.
 
-### Transport (NYA-TRANSPORT-001 — NYA-TRANSPORT-006)
+### Config
 
-Emitted by the transport layer when a JSON-RPC frame or upstream
-connection fails.
+| Code | Default | Catalog summary | Current emission status |
+|---|---|---|---|
+| `NYA-CONFIG-001` | rejected | invalid configuration | Used as a CLI error label, not constructed as an `Omen`. |
+| `NYA-CONFIG-002` | rejected | unknown profile | Catalog only; loaders return ordinary error tuples. |
+| `NYA-CONFIG-003` | rejected | profile validation failed | Catalog only; loaders return ordinary error tuples. |
 
-| Code | Severity | Summary |
-|------|----------|---------|
-| `NYA-TRANSPORT-001` | rejected | message size exceeded |
-| `NYA-TRANSPORT-002` | rejected | malformed JSON-RPC frame |
-| `NYA-TRANSPORT-003` | rejected | request timeout |
-| `NYA-TRANSPORT-004` | rejected | upstream process failure |
-| `NYA-TRANSPORT-005` | normalized | stdout protocol purity enforced |
-| `NYA-TRANSPORT-006` | rejected | session isolation violation |
+## Where diagnostics are assembled
 
-### Argument (NYA-ARG-001 — NYA-ARG-003)
+- `Profile.Projector` creates schema/profile omens and determines projection
+  acceptance.
+- `ToolGrimoire` adds tool/profile context, alias omens, and the general
+  `NYA-SCHEMA-001` compile-failure omen, then reapplies policy.
+- `RewriteTalisman` returns argument-repair omens to its caller.
+- CLI `inspect` and `matrix` build report inputs from compilation and
+  projection. Textual CLI failures that include a `NYA-*` label are not
+  automatically `Omen` structs.
+- Report renderers can serialize the omens they receive; they cannot infer
+  transformations for which no omen was emitted.
 
-Emitted by `Nyanform.RewriteTalisman` when repairing client arguments
-that were serialized incorrectly (e.g. a JSON object sent as a string).
-
-| Code | Severity | Summary |
-|------|----------|---------|
-| `NYA-ARG-001` | normalized | JSON string argument repaired to object |
-| `NYA-ARG-002` | normalized | JSON string argument repaired to array |
-| `NYA-ARG-003` | rejected | argument repair rejected |
-
-### Config (NYA-CONFIG-001 — NYA-CONFIG-003)
-
-Emitted by `Nyanform.Config.Loader` and the CLI when configuration is
-invalid.
-
-| Code | Severity | Summary |
-|------|----------|---------|
-| `NYA-CONFIG-001` | rejected | invalid configuration |
-| `NYA-CONFIG-002` | rejected | unknown profile |
-| `NYA-CONFIG-003` | rejected | profile validation failed |
-
----
-
-## How codes are emitted
-
-Codes are produced at three points:
-
-1. **Parsing/canonicalization** — `Nyanform.Schema.Parser` and
-   `Canonicalizer` return `ValidationError` structs whose `code` field is
-   an atom (e.g. `:schema_depth_exceeded`). The CLI translates these to
-   the corresponding `NYA-SCHEMA-*` string code when constructing an
-   omen.
-2. **Projection** — `Nyanform.Profile.Projector` constructs omens directly
-   with the `NYA-SCHEMA-*` / `NYA-PROFILE-*` string codes.
-3. **Tool catalog** — `Nyanform.ToolGrimoire` constructs
-   `NYA-ALIAS-*` and `NYA-SCHEMA-001` omens when sanitizing names or
-   failing to compile a schema.
-
-The `Codes` module is the single source of truth for code metadata. The
-SARIF renderer reads it to populate the `rules` array, and the terminal
-renderer uses severities to decide display formatting.
+`Diagnostic.Codes` remains the metadata registry for `fetch/1`, `all/0`, and
+`categories/0`. Treat it as a stable vocabulary, not as coverage evidence.

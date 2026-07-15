@@ -5,7 +5,7 @@ defmodule Nyanform.Session.Thread do
   @upstream_lease_call_grace_ms 1_000
 
   alias Nyanform.ClientFamiliar
-  alias Nyanform.Profile.{Builtins, Projector}
+  alias Nyanform.Profile.Builtins
   alias Nyanform.Protocol.{ErrorCodes, Lifecycle, Message}
   alias Nyanform.RewriteTalisman
   alias Nyanform.Schema.Pipeline
@@ -29,6 +29,7 @@ defmodule Nyanform.Session.Thread do
           pending_upstream: :queue.queue(Message.t()),
           pending_upstream_count: non_neg_integer(),
           max_pending_upstream: pos_integer(),
+          max_tool_count: pos_integer(),
           upstream_subscriber: {pid(), reference()} | nil,
           upstream_waiter: {pid(), reference(), GenServer.from(), reference(), reference()} | nil,
           upstream_delivery: {pid(), reference(), reference(), [Message.t()]} | nil,
@@ -66,7 +67,13 @@ defmodule Nyanform.Session.Thread do
       policy: policy,
       tool_include: Map.get(tool_filters, :include),
       tool_exclude: Map.get(tool_filters, :exclude),
-      max_pending_upstream: Keyword.get(session_opts, :max_pending_upstream, 128)
+      max_pending_upstream: Keyword.get(session_opts, :max_pending_upstream, 128),
+      max_tool_count:
+        Keyword.get(
+          session_opts,
+          :max_tool_count,
+          Application.get_env(:nyanform, :max_tool_count, 1024)
+        )
     ]
 
     DynamicSupervisor.start_child(Nyanform.Session.Supervisor, %{
@@ -172,6 +179,22 @@ defmodule Nyanform.Session.Thread do
     end
   end
 
+  @spec sync_upstream(String.t()) :: :ok | {:error, term()}
+  def sync_upstream(session_id) do
+    case Registry.lookup(Nyanform.Session.Registry, session_id) do
+      [{pid, _}] ->
+        try do
+          GenServer.call(pid, :sync_upstream, 5_000)
+        catch
+          :exit, {:noproc, _reason} -> {:error, :session_not_found}
+          :exit, reason -> {:error, {:session_exit, reason}}
+        end
+
+      [] ->
+        {:error, :session_not_found}
+    end
+  end
+
   @spec touch(String.t()) :: :ok | {:error, :session_not_found}
   def touch(session_id) do
     case Registry.lookup(Nyanform.Session.Registry, session_id) do
@@ -233,6 +256,7 @@ defmodule Nyanform.Session.Thread do
     profile_name = Keyword.fetch!(opts, :profile)
     policy = Keyword.get(opts, :policy, :strict)
     max_pending_upstream = normalize_queue_limit(Keyword.get(opts, :max_pending_upstream, 128))
+    max_tool_count = normalize_queue_limit(Keyword.get(opts, :max_tool_count, 1024))
 
     case UpstreamShrine.start_link(upstream_config) do
       {:ok, upstream_pid} ->
@@ -261,6 +285,7 @@ defmodule Nyanform.Session.Thread do
                pending_upstream: :queue.new(),
                pending_upstream_count: 0,
                max_pending_upstream: max_pending_upstream,
+               max_tool_count: max_tool_count,
                upstream_subscriber: nil,
                upstream_waiter: nil,
                upstream_delivery: nil,
@@ -310,33 +335,23 @@ defmodule Nyanform.Session.Thread do
         _from,
         state
       ) do
-    case UpstreamShrine.list_tools(state.upstream_pid) do
+    params = normalize_list_tools_params(msg.params)
+
+    case UpstreamShrine.list_tools(state.upstream_pid, params) do
       {:ok, tools_msg} ->
-        result = tools_msg.result || %{}
-        upstream_tools = Map.get(result, "tools", [])
-        next_cursor = Map.get(result, "nextCursor")
+        case tools_msg.result do
+          result when is_map(result) ->
+            case Map.get(result, "tools", []) do
+              upstream_tools when is_list(upstream_tools) ->
+                handle_tools_page(msg, result, upstream_tools, params, state)
 
-        filtered_tools = apply_tool_filters(upstream_tools, state)
+              _invalid_tools ->
+                invalid_tools_list_reply(msg, state, "contains a non-list tools value")
+            end
 
-        grimoire = ToolGrimoire.build(filtered_tools, state.constellation, state.policy)
-
-        projected_tools =
-          grimoire.entries
-          |> Enum.filter(&(&1.accepted || state.policy == :permissive))
-          |> Enum.map(fn entry ->
-            upstream_tool = Enum.find(filtered_tools, &(&1["name"] == entry.name)) || %{}
-            project_tool(entry, upstream_tool, state)
-          end)
-
-        response_result = %{"tools" => projected_tools}
-
-        response_result =
-          if next_cursor,
-            do: Map.put(response_result, "nextCursor", next_cursor),
-            else: response_result
-
-        response = Message.response(msg.id, response_result)
-        {:reply, {:reply, response}, %{state | grimoire: grimoire}}
+          _invalid_result ->
+            invalid_tools_list_reply(msg, state, "is not an object")
+        end
 
       {:error, reason} ->
         error =
@@ -473,6 +488,13 @@ defmodule Nyanform.Session.Thread do
     {:reply, :ok, %{state | last_activity_ms: now_ms()}}
   end
 
+  def handle_call(:sync_upstream, _from, state) do
+    case UpstreamShrine.sync(state.upstream_pid) do
+      :ok -> {:reply, :ok, drain_upstream_mailbox(state)}
+      {:error, reason} -> {:reply, {:error, reason}, drain_upstream_mailbox(state)}
+    end
+  end
+
   def handle_call(:last_activity, _from, state) do
     {:reply, state.last_activity_ms, state}
   end
@@ -483,21 +505,7 @@ defmodule Nyanform.Session.Thread do
 
   @impl true
   def handle_info({:upstream_message, %Message{} = msg}, state) do
-    state = %{state | last_activity_ms: now_ms()}
-
-    case state.upstream_subscriber do
-      {subscriber, _monitor} when is_pid(subscriber) ->
-        if Process.alive?(subscriber) do
-          send(subscriber, {:nyanform_upstream, msg})
-          {:noreply, state}
-        else
-          {:noreply,
-           state |> clear_subscriber() |> enqueue_upstream(msg) |> fulfill_upstream_waiter()}
-        end
-
-      nil ->
-        {:noreply, state |> enqueue_upstream(msg) |> fulfill_upstream_waiter()}
-    end
+    {:noreply, deliver_upstream_message(state, msg)}
   end
 
   def handle_info({:upstream_lease_timeout, lease_ref}, state) do
@@ -576,7 +584,11 @@ defmodule Nyanform.Session.Thread do
           {:ok, origin_name} ->
             entry = find_tool(grimoire, origin_name)
             schema = compile_tool_schema(entry)
-            repair_result = RewriteTalisman.repair(arguments, schema)
+
+            repair_result =
+              RewriteTalisman.repair(arguments, schema,
+                drop_optional_nulls: state.constellation.requires_all_properties_required
+              )
 
             call_msg =
               Message.request(Lifecycle.generate_id(), "tools/call", %{
@@ -770,10 +782,102 @@ defmodule Nyanform.Session.Thread do
 
   defp clear_subscriber(state), do: state
 
+  defp drain_upstream_mailbox(state) do
+    receive do
+      {:upstream_message, %Message{} = msg} ->
+        state |> deliver_upstream_message(msg) |> drain_upstream_mailbox()
+    after
+      0 -> state
+    end
+  end
+
+  defp deliver_upstream_message(state, %Message{} = msg) do
+    state = %{state | last_activity_ms: now_ms()}
+
+    case state.upstream_subscriber do
+      {subscriber, _monitor} when is_pid(subscriber) ->
+        if Process.alive?(subscriber) do
+          send(subscriber, {:nyanform_upstream, msg})
+          state
+        else
+          state |> clear_subscriber() |> enqueue_upstream(msg) |> fulfill_upstream_waiter()
+        end
+
+      nil ->
+        state |> enqueue_upstream(msg) |> fulfill_upstream_waiter()
+    end
+  end
+
   defp now_ms, do: System.monotonic_time(:millisecond)
 
   defp find_tool(grimoire, origin_name) do
     Enum.find(grimoire.entries, &(&1.name == origin_name))
+  end
+
+  defp normalize_list_tools_params(params) when is_map(params), do: params
+  defp normalize_list_tools_params(_params), do: %{}
+
+  defp invalid_tools_list_reply(msg, state, detail) do
+    error =
+      Message.error_response(
+        msg.id,
+        ErrorCodes.internal_error(),
+        "upstream tools/list result #{detail}"
+      )
+
+    {:reply, {:reply, error}, state}
+  end
+
+  defp handle_tools_page(msg, result, upstream_tools, params, state) do
+    next_cursor = Map.get(result, "nextCursor")
+    filtered_tools = apply_tool_filters(upstream_tools, state)
+
+    {grimoire, page_entries} =
+      update_grimoire(state.grimoire, filtered_tools, params, state)
+
+    if length(grimoire.entries) > state.max_tool_count do
+      invalid_tools_list_reply(
+        msg,
+        state,
+        "exceeds the configured tool limit of #{state.max_tool_count}"
+      )
+    else
+      projected_tools =
+        page_entries
+        |> Enum.zip(filtered_tools)
+        |> Enum.filter(fn {entry, _upstream_tool} ->
+          entry.publishable and (entry.accepted || state.policy == :permissive)
+        end)
+        |> Enum.map(fn {entry, upstream_tool} ->
+          project_tool(entry, upstream_tool)
+        end)
+
+      response_result = %{"tools" => projected_tools}
+
+      response_result =
+        if next_cursor,
+          do: Map.put(response_result, "nextCursor", next_cursor),
+          else: response_result
+
+      response = Message.response(msg.id, response_result)
+      {:reply, {:reply, response}, %{state | grimoire: grimoire}}
+    end
+  end
+
+  defp update_grimoire(grimoire, tools, params, state) do
+    if grimoire != nil and Map.has_key?(params, "cursor") do
+      updated = ToolGrimoire.append(grimoire, tools, state.constellation, state.policy)
+
+      page_entries =
+        Enum.map(tools, fn tool ->
+          Enum.find(updated.entries, &(&1.name == tool_name(tool)))
+        end)
+
+      {updated, page_entries}
+    else
+      updated = ToolGrimoire.build(tools, state.constellation, state.policy)
+      {updated, updated.entries}
+    end
   end
 
   defp compile_tool_schema(nil), do: nil
@@ -795,23 +899,11 @@ defmodule Nyanform.Session.Thread do
 
   defp correlate_response(response, _client_id), do: response
 
-  defp project_tool(entry, upstream_tool, state) do
-    input_schema = entry.input_schema
-
-    projected_schema =
-      case Pipeline.compile(input_schema) do
-        {:ok, %{scroll: scroll}} ->
-          projection = Projector.project(scroll, state.constellation, state.policy)
-          projection.schema
-
-        {:error, _} ->
-          input_schema
-      end
-
+  defp project_tool(entry, upstream_tool) do
     base = %{
       "name" => entry.alias,
       "description" => entry.description,
-      "inputSchema" => projected_schema
+      "inputSchema" => entry.projected_schema
     }
 
     base =
@@ -859,7 +951,7 @@ defmodule Nyanform.Session.Thread do
 
   defp filter_included(tools, patterns) when is_list(patterns) do
     Enum.filter(tools, fn tool ->
-      name = Map.get(tool, "name", "")
+      name = tool_name(tool)
       Enum.any?(patterns, &tool_matches?(name, &1))
     end)
   end
@@ -868,7 +960,7 @@ defmodule Nyanform.Session.Thread do
 
   defp filter_excluded(tools, patterns) when is_list(patterns) do
     Enum.reject(tools, fn tool ->
-      name = Map.get(tool, "name", "")
+      name = tool_name(tool)
       Enum.any?(patterns, &tool_matches?(name, &1))
     end)
   end
@@ -878,5 +970,14 @@ defmodule Nyanform.Session.Thread do
       {:ok, regex} -> Regex.match?(regex, name)
       {:error, _} -> name == pattern
     end
+  end
+
+  defp tool_name(%{"name" => name}) when is_binary(name), do: name
+
+  defp tool_name(tool) do
+    suffix = tool |> :erlang.term_to_binary() |> then(&:crypto.hash(:sha256, &1))
+    suffix = Base.encode16(suffix, case: :lower)
+
+    "invalid_tool_" <> String.slice(suffix, 0, 8)
   end
 end

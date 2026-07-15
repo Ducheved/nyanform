@@ -2,71 +2,78 @@
 
 ## Reporting a vulnerability
 
-Please report security vulnerabilities privately rather than opening a
-public issue.
+This repository does not currently advertise a verified private vulnerability
+mailbox or a response-time SLA. Do not assume that GitHub private vulnerability
+reporting is enabled, and do not open a public issue containing exploit details,
+credentials, private schemas, or other sensitive material.
 
-Email: **security@ducheved.dev**
+For a non-sensitive hardening problem, a public issue is appropriate. For a
+sensitive vulnerability, contact the repository owner through a verified
+GitHub channel first and agree on a private channel before sending details. If
+no private channel is available, retain the sensitive details until one is
+established.
 
-Include the following when you report:
+Once a private channel has been agreed, useful report context includes:
 
-- A description of the issue and its potential impact.
-- Steps to reproduce, including any minimal MCP server configuration,
-  schema, or JSON-RPC payload that triggers the issue.
-- The Nyanform version (`nyanform doctor` output) and the Elixir/OTP
-  versions you ran against.
-- Whether the issue is in the schema compiler, the proxy lifecycle, the
-  transports, or the CLI.
+- The impact and minimal reproduction.
+- The relevant MCP configuration, schema, or JSON-RPC payload with unrelated
+  secrets removed.
+- The exact source revision or artifact provenance, plus `elixir -v` output.
+- `nyanform doctor` output as additional environment context. `doctor` reports
+  the running Elixir version and checks configured protocol/profile data; it
+  does not identify the Nyanform release or Git commit.
+- Whether the issue affects schema compilation, profile projection, session
+  lifecycle, transport behavior, configuration, or the CLI.
 
-You should receive an initial response within 72 hours. Please do not
-disclose the issue publicly until a fix has been released and you have
-been given the all-clear.
+No acknowledgement, remediation, embargo, private-branch, or release timeline
+is guaranteed by this policy.
 
 ## Scope
 
-Nyanform sits between an MCP client and one or more MCP servers. Both
-sides are treated as untrusted. The following are considered in scope:
+Nyanform sits between an MCP client and an MCP server and treats data from both
+sides as untrusted. Relevant security issues include:
 
-- Bypass of any resource limit (message size, schema depth, reference
-  depth, HTTP body size, request timeout).
-- Memory exhaustion or unbounded recursion triggered by a malicious
-  upstream schema, client frame, or tool argument.
-- Command injection or argument injection in the stdio transport (Nyanform
-  spawns upstream servers via Erlang ports and `:spawn_executable`; any
-  path that reaches a shell is a vulnerability).
-- stdout protocol corruption in stdio mode (anything written to stdout
-  that is not a valid JSON-RPC frame).
-- Secret leakage in diagnostics, logs, snapshots, or reports.
-- Session isolation violations (one session's data leaking into another).
+- Bypassing an active message-size, schema-depth, local-reference traversal,
+  downstream HTTP body-size, matrix-concurrency, or upstream request-timeout
+  boundary.
+- Memory exhaustion or unbounded recursion caused by malicious frames or
+  schemas.
+- Command or argument injection in the stdio transport. The current transport
+  launches an executable directly with Erlang ports and does not invoke a
+  shell.
+- Non-JSON-RPC output written by Nyanform to stdout in stdio mode.
+- Secret leakage in configuration errors, diagnostics, logs, snapshots, or
+  reports.
+- Data crossing session boundaries.
 
-The following are considered **out of scope** under default configuration:
+`max_tool_count` is enforced for live session catalogs and for full-catalog CLI
+fetches. The default is 1024 entries. `max_diagnostic_count` exists in
+`Nyanform.Limits`, but diagnostic accumulators do not enforce it, so it must not
+be treated as a security boundary.
 
-- Attacks against clients or servers that Nyanform proxies. Nyanform does
-  not authenticate or authorize either side; it is a transparent proxy.
-- Network exposure of the HTTP downstream when the operator has not
-  changed the default `127.0.0.1` binding.
-- TLS termination, which is the operator's responsibility (run Nyanform
-  behind a TLS-terminating reverse proxy).
+The following remain operator responsibilities:
 
-See [docs/security.md](docs/security.md) for the full defense-in-depth
-model.
+- Authentication and authorization for clients and upstream servers. Nyanform
+  does not provide either.
+- Exposure beyond the default loopback HTTP binding.
+- TLS termination and reverse-proxy configuration.
+- Reviewing snapshot contents. Snapshots omit tool-call arguments, but retain
+  raw server metadata, tool descriptions, input schemas, and output schemas.
+  Secrets embedded in descriptions, defaults, examples, annotations, or
+  extensions are not automatically redacted.
+
+See [docs/security.md](docs/security.md) for the implemented controls and their
+limits.
 
 ## Supported versions
 
-Nyanform is pre-1.0 and currently in active development. Only the latest
-release line receives security fixes.
+No version tag or GitHub Release has been published. The `0.1.0` value in
+`mix.exs` is package metadata only. Security fixes, when made, are applied to
+the current source branch; there is no published release line with a declared
+support window.
 
-| Version | Supported |
-|---------|-----------|
-| 0.1.x   | yes       |
-| < 0.1   | no        |
+## Coordination
 
-## Disclosure policy
-
-1. We acknowledge receipt of the report within 72 hours.
-2. We investigate and confirm the vulnerability, then develop and test a
-   fix on a private branch.
-3. We coordinate a release date with the reporter, typically within 14
-   days of confirmation for high-severity issues.
-4. We publish a patched release and credit the reporter (unless they
-   prefer to remain anonymous) in the release notes and
-   [CHANGELOG.md](CHANGELOG.md).
+Maintainers may coordinate validation, fixes, disclosure timing, and reporter
+credit after a usable private channel exists. Any such coordination is
+case-specific and is not a standing SLA or release guarantee.

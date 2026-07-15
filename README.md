@@ -1,26 +1,13 @@
 # Nyanform
 
-Make one MCP server work everywhere.
+Inspect and adapt MCP tool schemas across client boundaries.
 
-Nyanform is a local-first MCP compatibility proxy and schema compiler. It sits between an MCP client and an MCP server, compiles upstream tool schemas into a canonical representation, and produces a compatible schema dialect for the connected client.
+Nyanform is a local-first MCP compatibility proxy and schema compiler. It sits between an MCP client and an MCP server, compiles upstream tool schemas into a canonical representation, and projects them into an explicitly selected schema profile.
 
 ## Quick start
 
 ```sh
 mix nyanform inspect --stdio-command node --stdio-arg server.js
-```
-
-## Compatibility report
-
-```
-Profile        Policy  Tools  Accepted  Worst     Omens  Duration
--------------------------------------------------------------------
-canonical      strict  10     yes       exact     1      43.2ms
-claude         strict  10     no        rejected  1      43.1ms
-gemini         strict  10     no        rejected  4      43.1ms
-openai_strict  strict  10     no        rejected  5      43.1ms
-passthrough    strict  10     yes       exact     1      43.2ms
-vscode         strict  10     no        rejected  1      43.0ms
 ```
 
 ## Installation
@@ -52,7 +39,16 @@ docker run --rm -i \
 
 ## Client configuration examples
 
-### Claude Code (stdio to stdio)
+Profiles are transformation targets, not certifications for an entire client.
+Prefer an explicit `--profile` when the downstream schema contract is known.
+`--profile auto` is only a `clientInfo.name` heuristic; unknown names use
+`canonical`.
+
+### Claude Code with an explicit preset (stdio to stdio)
+
+This opts into Nyanform's `claude` compatibility preset. The preset is not an
+official or exhaustive Claude Code schema specification, so verify the actual
+server and client combination before relying on it.
 
 ```json
 {
@@ -65,7 +61,12 @@ docker run --rm -i \
 }
 ```
 
-### Cursor / OpenAI strict (stdio to stdio)
+### OpenAI strict projection (stdio to stdio)
+
+Select `openai_strict` only when the downstream tool contract requires
+[OpenAI strict function schemas](https://developers.openai.com/api/docs/guides/function-calling).
+Nyanform does not infer this profile merely because the client is Cursor,
+Continue, or Codex.
 
 ```json
 {
@@ -77,6 +78,29 @@ docker run --rm -i \
   }
 }
 ```
+
+The profile requires an object root, represents optional properties as required
+nullable fields, closes every object with `additionalProperties: false`,
+accepts nested `anyOf` and local `$defs`/`$ref`, and treats `allOf` as
+unsupported. Closing an open source object is lossy, so use `compatible` to
+permit that adaptation; `strict` accepts only already-closed source objects.
+
+### Canonical and passthrough
+
+- `canonical` parses and usually re-emits schemas in Nyanform's normalized
+  dialect. An untyped or otherwise unknown `Scroll` uses its retained raw
+  schema as a fallback, and JSON Schema boolean values remain `true` or
+  `false`. Keywords outside Nyanform's modeled subset, including
+  `prefixItems`, emit a rejected diagnostic instead of disappearing silently.
+  The profile is the default for unknown clients.
+- `passthrough` bypasses schema projection and forwards each original schema
+  value unchanged after structural compilation succeeds. Use it when preserving
+  the upstream schema is more important than normalization or projection
+  diagnostics, including when a tool depends on `prefixItems`.
+- `gemini` is a compatibility hypothesis informed by the documented Gemini CLI MCP sanitizer. Nyanform accepts and
+  preserves `additionalProperties: false`; the
+  [Gemini CLI sanitizer](https://geminicli.com/docs/tools/mcp-server/) removes
+  `additionalProperties` later during tool discovery.
 
 ### Streamable HTTP downstream
 
@@ -99,9 +123,9 @@ nyanform serve --config nyanform.json
 
 Nyanform is an Elixir/OTP application with these core layers:
 
-- **Schema compiler** — parses JSON Schema into a canonical `Scroll` struct, resolves references, detects cycles, and computes deterministic digests.
-- **Compatibility profiles** — declarative data describing what each MCP client accepts. A shared projector compiles canonical schemas into client-specific dialects, emitting structured omens for every transformation.
-- **Proxy lifecycle** — OTP-supervised session processes that intercept `tools/list` and `tools/call`, project schemas, repair arguments, and transparently pass through all other JSON-RPC messages.
+- **Schema compiler** — parses and canonicalizes JSON Schema into a `Scroll` struct, marks bounded recursive references, and computes deterministic digests.
+- **Compatibility profiles** — declarative projection targets. A shared projector emits structured omens for selected rewrites and incompatibilities; vendor-named presets are not integration guarantees.
+- **Proxy lifecycle** — OTP-supervised session processes intercept `tools/list` and `tools/call`, project schemas, repair arguments, and semantically relay the supported JSON-RPC shape for other messages.
 - **Transports** — stdio and Streamable HTTP for both downstream (client-facing) and upstream (server-facing) connections.
 - **CLI** — `serve`, `inspect`, `matrix`, `snapshot`, `check`, and `doctor` commands.
 
@@ -114,7 +138,7 @@ See [docs/architecture.md](docs/architecture.md) for details.
 | `nyanform serve` | Run as a proxy between a client and an upstream MCP server |
 | `nyanform inspect` | Connect to a server, validate schemas, print a report |
 | `nyanform matrix` | Compile a server against every compatibility profile |
-| `nyanform snapshot` | Save a deterministic canonical snapshot |
+| `nyanform snapshot` | Save selected catalog fields in name order with canonical input digests |
 | `nyanform check` | Compare a live server with a stored snapshot |
 | `nyanform doctor` | Check configuration and environment |
 

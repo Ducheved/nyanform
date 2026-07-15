@@ -3,6 +3,8 @@ defmodule Nyanform.CLITest do
 
   @moduletag :integration
   @fixture_server ["node", "test/fixtures/mcp_server.js"]
+  @paginated_server ["node", "test/fixtures/paginated_server.js"]
+  @malformed_server ["node", "test/fixtures/malformed_catalog_server.js"]
 
   describe "doctor" do
     test "returns exit code 0" do
@@ -82,6 +84,82 @@ defmodule Nyanform.CLITest do
       parsed = Jason.decode!(output)
       assert parsed["omens"] != []
       assert Enum.all?(parsed["omens"], &(&1["profile"] == "gemini"))
+    end
+
+    test "inspects every tools/list page" do
+      output =
+        capture_cli([
+          "inspect",
+          "--stdio-command",
+          Enum.at(@paginated_server, 0),
+          "--stdio-arg",
+          Enum.at(@paginated_server, 1),
+          "--format",
+          "json"
+        ])
+
+      assert Jason.decode!(output)["tool_count"] == 2
+    end
+
+    test "reports malformed entries without crashing" do
+      output =
+        capture_cli([
+          "inspect",
+          "--stdio-command",
+          Enum.at(@malformed_server, 0),
+          "--stdio-arg",
+          Enum.at(@malformed_server, 1),
+          "--stdio-arg",
+          "entries",
+          "--format",
+          "json"
+        ])
+
+      report = Jason.decode!(output)
+      assert report["tool_count"] == 3
+      assert "healthy" not in report["rejected_tools"]
+      assert length(report["rejected_tools"]) == 2
+    end
+
+    test "reports aliases and rejections according to the live policy" do
+      args = [
+        "inspect",
+        "--stdio-command",
+        Enum.at(@fixture_server, 0),
+        "--stdio-arg",
+        Enum.at(@fixture_server, 1),
+        "--profile",
+        "openai_strict",
+        "--format",
+        "json"
+      ]
+
+      strict = args |> capture_cli() |> Jason.decode!()
+      permissive = (args ++ ["--policy", "permissive"]) |> capture_cli() |> Jason.decode!()
+
+      assert "union_tool" in strict["rejected_tools"]
+      refute Map.has_key?(strict["aliases"], "union_tool")
+      refute "union_tool" in permissive["rejected_tools"]
+      assert permissive["aliases"]["union_tool"] == "union_tool"
+      refute permissive["schema_valid"]
+      assert Enum.any?(permissive["omens"], &(&1["severity"] == "rejected"))
+    end
+
+    test "fails cleanly for a non-list tools value" do
+      {_output, exit_code} =
+        run_cli_with_exit([
+          "inspect",
+          "--stdio-command",
+          Enum.at(@malformed_server, 0),
+          "--stdio-arg",
+          Enum.at(@malformed_server, 1),
+          "--stdio-arg",
+          "non-list",
+          "--format",
+          "json"
+        ])
+
+      assert exit_code == 1
     end
 
     test "rejects unsupported report formats" do
@@ -192,11 +270,15 @@ defmodule Nyanform.CLITest do
         run_cli_with_exit([
           "matrix",
           "--stdio-command",
-          Enum.at(@fixture_server, 0),
+          Enum.at(@malformed_server, 0),
           "--stdio-arg",
-          Enum.at(@fixture_server, 1),
+          Enum.at(@malformed_server, 1),
+          "--stdio-arg",
+          "lossy",
           "--profile",
-          "gemini",
+          "claude",
+          "--policy",
+          "compatible",
           "--no-fail-on-rejected",
           "--fail-on-lossy",
           "--format",
@@ -249,6 +331,27 @@ defmodule Nyanform.CLITest do
       File.rm(path1)
       File.rm(path2)
     end
+
+    test "includes every tools/list page" do
+      path = tmp_path("paginated_snapshot.json")
+
+      run_cli([
+        "snapshot",
+        "--stdio-command",
+        Enum.at(@paginated_server, 0),
+        "--stdio-arg",
+        Enum.at(@paginated_server, 1),
+        "--output",
+        path
+      ])
+
+      names =
+        path |> File.read!() |> Jason.decode!() |> Map.fetch!("tools") |> Enum.map(& &1["name"])
+
+      assert names == ["collision name", "collision_name"]
+
+      File.rm(path)
+    end
   end
 
   describe "check" do
@@ -278,6 +381,81 @@ defmodule Nyanform.CLITest do
         ])
 
       assert check_exit == 0
+
+      File.rm(snapshot_path)
+    end
+
+    test "reports a tool description change as metadata only" do
+      snapshot_path = tmp_path("metadata_snapshot.json")
+
+      run_cli([
+        "snapshot",
+        "--stdio-command",
+        Enum.at(@fixture_server, 0),
+        "--stdio-arg",
+        Enum.at(@fixture_server, 1),
+        "--output",
+        snapshot_path
+      ])
+
+      snapshot = snapshot_path |> File.read!() |> Jason.decode!()
+      [first | rest] = snapshot["tools"]
+      changed = put_in(snapshot["tools"], [Map.put(first, "description", "changed") | rest])
+      File.write!(snapshot_path, Jason.encode!(changed, pretty: true))
+
+      {output, exit_code} =
+        run_cli_with_exit([
+          "check",
+          "--stdio-command",
+          Enum.at(@fixture_server, 0),
+          "--stdio-arg",
+          Enum.at(@fixture_server, 1),
+          "--snapshot",
+          snapshot_path,
+          "--format",
+          "json"
+        ])
+
+      assert exit_code == 0
+      assert String.contains?(output, "metadata_only")
+
+      File.rm(snapshot_path)
+    end
+
+    test "recomputes stored schema digest instead of trusting snapshot metadata" do
+      snapshot_path = tmp_path("stale_digest_snapshot.json")
+
+      run_cli([
+        "snapshot",
+        "--stdio-command",
+        Enum.at(@fixture_server, 0),
+        "--stdio-arg",
+        Enum.at(@fixture_server, 1),
+        "--output",
+        snapshot_path
+      ])
+
+      snapshot = snapshot_path |> File.read!() |> Jason.decode!()
+      [first | rest] = snapshot["tools"]
+      changed_first = Map.put(first, "input_schema", %{"type" => "string"})
+      changed = put_in(snapshot["tools"], [changed_first | rest])
+      File.write!(snapshot_path, Jason.encode!(changed, pretty: true))
+
+      {output, exit_code} =
+        run_cli_with_exit([
+          "check",
+          "--stdio-command",
+          Enum.at(@fixture_server, 0),
+          "--stdio-arg",
+          Enum.at(@fixture_server, 1),
+          "--snapshot",
+          snapshot_path,
+          "--format",
+          "json"
+        ])
+
+      assert exit_code == 1
+      assert String.contains?(output, "schema_changed")
 
       File.rm(snapshot_path)
     end

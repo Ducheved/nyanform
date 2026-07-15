@@ -10,15 +10,27 @@ defmodule Nyanform.RewriteTalisman do
 
   @spec repair(map(), Scroll.t() | nil) :: repair_result()
   def repair(arguments, schema) when is_map(arguments) do
-    {repaired, omens} = repair_object(arguments, schema, [])
-    %{arguments: repaired, omens: omens, original_preserved: arguments}
+    repair(arguments, schema, [])
   end
 
   def repair(arguments, _schema) when not is_map(arguments) do
     %{arguments: arguments, omens: [], original_preserved: arguments}
   end
 
-  defp repair_object(obj, %Scroll{kind: :object, properties: props}, path) when is_map(obj) do
+  @spec repair(map(), Scroll.t() | nil, keyword()) :: repair_result()
+  def repair(arguments, schema, opts) when is_map(arguments) and is_list(opts) do
+    drop_optional_nulls = Keyword.get(opts, :drop_optional_nulls, false)
+    {repaired, omens} = repair_object(arguments, schema, [], drop_optional_nulls)
+    %{arguments: repaired, omens: omens, original_preserved: arguments}
+  end
+
+  defp repair_object(
+         obj,
+         %Scroll{kind: :object, properties: props, required: required},
+         path,
+         drop_optional_nulls
+       )
+       when is_map(obj) do
     case props do
       nil ->
         {obj, []}
@@ -27,8 +39,16 @@ defmodule Nyanform.RewriteTalisman do
         Enum.reduce(obj, {obj, []}, fn {key, value}, {acc, acc_omens} ->
           case Map.fetch(prop_map, key) do
             {:ok, prop_schema} ->
-              {repaired_value, value_omens} = repair_value(value, prop_schema, path ++ [key])
-              {Map.put(acc, key, repaired_value), acc_omens ++ value_omens}
+              repair_property(
+                key,
+                value,
+                prop_schema,
+                required,
+                acc,
+                acc_omens,
+                path,
+                drop_optional_nulls
+              )
 
             :error ->
               {acc, acc_omens}
@@ -37,12 +57,60 @@ defmodule Nyanform.RewriteTalisman do
     end
   end
 
-  defp repair_object(obj, _schema, _path), do: {obj, []}
+  defp repair_object(obj, _schema, _path, _drop_optional_nulls), do: {obj, []}
 
-  defp repair_value(value, %Scroll{kind: :object} = schema, path) when is_binary(value) do
+  defp repair_property(key, nil, schema, required, acc, acc_omens, path, true) do
+    if optional_non_nullable?(key, schema, required) do
+      omen =
+        Omen.normalized("NYA-ARG-004",
+          schema_path: path ++ [key],
+          rule: "synthetic_optional_null_removed",
+          source: "null",
+          target: "property omitted",
+          explanation: "synthetic null removed for an originally optional property"
+        )
+
+      {Map.delete(acc, key), acc_omens ++ [omen]}
+    else
+      {acc, acc_omens}
+    end
+  end
+
+  defp repair_property(
+         key,
+         value,
+         schema,
+         _required,
+         acc,
+         acc_omens,
+         path,
+         drop_optional_nulls
+       ) do
+    {repaired_value, value_omens} =
+      repair_value(value, schema, path ++ [key], drop_optional_nulls)
+
+    {Map.put(acc, key, repaired_value), acc_omens ++ value_omens}
+  end
+
+  defp optional_non_nullable?(key, schema, required) do
+    key not in (required || []) and not accepts_null?(schema)
+  end
+
+  defp accepts_null?(%Scroll{kind: kind}) when kind in [:any, :null], do: true
+
+  defp accepts_null?(%Scroll{branches: branches}) when is_list(branches) do
+    Enum.any?(branches, &accepts_null?/1)
+  end
+
+  defp accepts_null?(%Scroll{enum: enum}) when is_list(enum), do: nil in enum
+  defp accepts_null?(%Scroll{const: nil}), do: true
+  defp accepts_null?(_schema), do: false
+
+  defp repair_value(value, %Scroll{kind: :object} = schema, path, drop_optional_nulls)
+       when is_binary(value) do
     case try_parse_json(value) do
       {:ok, parsed} when is_map(parsed) ->
-        {repaired, omens} = repair_object(parsed, schema, path)
+        {repaired, omens} = repair_object(parsed, schema, path, drop_optional_nulls)
 
         omen =
           Omen.normalized("NYA-ARG-001",
@@ -60,13 +128,20 @@ defmodule Nyanform.RewriteTalisman do
     end
   end
 
-  defp repair_value(value, %Scroll{kind: :array, items: %Scroll{} = items_schema}, path)
+  defp repair_value(
+         value,
+         %Scroll{kind: :array, items: %Scroll{} = items_schema},
+         path,
+         drop_optional_nulls
+       )
        when is_binary(value) do
     case try_parse_json(value) do
       {:ok, parsed} when is_list(parsed) ->
         {repaired_items, omens} =
           Enum.reduce(parsed, {[], []}, fn item, {acc, acc_omens} ->
-            {repaired, item_omens} = repair_value(item, items_schema, path ++ ["items"])
+            {repaired, item_omens} =
+              repair_value(item, items_schema, path ++ ["items"], drop_optional_nulls)
+
             {acc ++ [repaired], acc_omens ++ item_omens}
           end)
 
@@ -86,23 +161,35 @@ defmodule Nyanform.RewriteTalisman do
     end
   end
 
-  defp repair_value(value, %Scroll{kind: :object, properties: props} = schema, path)
+  defp repair_value(
+         value,
+         %Scroll{kind: :object, properties: props} = schema,
+         path,
+         drop_optional_nulls
+       )
        when is_map(value) do
-    repair_object(value, schema, path ++ props_property_hint(props))
+    repair_object(value, schema, path ++ props_property_hint(props), drop_optional_nulls)
   end
 
-  defp repair_value(value, %Scroll{kind: :array, items: %Scroll{} = items_schema}, path)
+  defp repair_value(
+         value,
+         %Scroll{kind: :array, items: %Scroll{} = items_schema},
+         path,
+         drop_optional_nulls
+       )
        when is_list(value) do
     {repaired_items, omens} =
       Enum.reduce(value, {[], []}, fn item, {acc, acc_omens} ->
-        {repaired, item_omens} = repair_value(item, items_schema, path ++ ["items"])
+        {repaired, item_omens} =
+          repair_value(item, items_schema, path ++ ["items"], drop_optional_nulls)
+
         {acc ++ [repaired], acc_omens ++ item_omens}
       end)
 
     {repaired_items, omens}
   end
 
-  defp repair_value(value, _schema, _path) do
+  defp repair_value(value, _schema, _path, _drop_optional_nulls) do
     {value, []}
   end
 

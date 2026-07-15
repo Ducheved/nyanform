@@ -33,7 +33,7 @@ error codes) or the terminal output verbatim.
 
 ## Environment
 
-- Nyanform version:
+- Nyanform source revision (`git rev-parse HEAD`) or artifact provenance:
 - Elixir version (`elixir -v`):
 - OTP version:
 - Operating system:
@@ -44,6 +44,10 @@ error codes) or the terminal output verbatim.
 
 ## Output of `nyanform doctor`
 
+`doctor` reports runtime and configured catalog information. It does not report
+the Nyanform Git revision or prove that the Elixir/OTP versions satisfy
+`mix.exs`, so keep the environment fields above.
+
 ```
 (paste nyanform doctor output)
 ```
@@ -51,5 +55,10 @@ error codes) or the terminal output verbatim.
 ## Schema or payload
 
 If the bug involves a specific schema or JSON-RPC payload, paste it here.
-Redact any secrets first (Nyanform redacts known secret keys, but please
-double-check).
+Remove secrets manually before posting. Automatic redaction is not applied to
+issue text, snapshots, schemas, descriptions, defaults, examples, annotations,
+enum/const values, or vendor extensions.
+
+Do not file exploitable vulnerability details or credentials in a public issue.
+Read `SECURITY.md` first; the repository currently does not promise a private
+reporting channel or response SLA.

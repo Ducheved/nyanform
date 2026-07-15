@@ -78,6 +78,8 @@ defmodule Nyanform.Transport.DownstreamStdio do
 
       {:nyanform_stdin, ^reader_pid, :eof} ->
         Process.demonitor(reader_ref, [:flush])
+        Thread.sync_upstream(session_id)
+        drain_upstream_messages()
         stop_session(session_id)
         0
 
@@ -101,6 +103,16 @@ defmodule Nyanform.Transport.DownstreamStdio do
   defp stop_session(session_id) do
     Thread.unsubscribe_upstream(session_id, self())
     Thread.stop(session_id)
+  end
+
+  defp drain_upstream_messages do
+    receive do
+      {:nyanform_upstream, %Message{} = message} ->
+        write_message(message)
+        drain_upstream_messages()
+    after
+      0 -> :ok
+    end
   end
 
   defp trim_line_ending(line) do

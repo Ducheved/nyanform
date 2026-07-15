@@ -1,6 +1,7 @@
 defmodule Nyanform.CLI do
   alias Nyanform.Config.Loader
   alias Nyanform.Diagnostic.Omen
+  alias Nyanform.Limits
   alias Nyanform.Profile.{Builtins, Projector}
   alias Nyanform.Protocol.Lifecycle
   alias Nyanform.Report.{CompatibilityResult, Renderer}
@@ -51,8 +52,11 @@ defmodule Nyanform.CLI do
          {:ok, config} <- resolve_serve_config(opts) do
       run_proxy(config)
     else
-      {:error, code} when is_integer(code) -> code
-      {:error, reason} -> error_exit("NYA-CONFIG-001", "configuration error: #{inspect(reason)}")
+      {:error, code} when is_integer(code) ->
+        code
+
+      {:error, reason} ->
+        error_exit("NYA-CONFIG-001", "configuration error: #{format_error(reason)}")
     end
   end
 
@@ -270,86 +274,55 @@ defmodule Nyanform.CLI do
   defp run_inspect(upstream_config, constellation, policy) do
     started = System.monotonic_time(:microsecond)
 
-    with {:ok, upstream_pid} <- UpstreamShrine.start_link(upstream_config),
-         {:ok, init_msg} <- UpstreamShrine.initialize(upstream_pid),
-         {:ok, tools_msg} <- UpstreamShrine.list_tools(upstream_pid) do
+    with_initialized_upstream(upstream_config, fn upstream_pid, init_msg ->
       init_result = init_msg.result || %{}
-      tools_result = tools_msg.result || %{}
-      tools = Map.get(tools_result, "tools", [])
 
-      {omens, unsupported, rejected, normalization, lossy} =
-        analyze_tools(tools, constellation, policy)
+      with {:ok, tools} <- list_all_tools(upstream_pid) do
+        grimoire = ToolGrimoire.build(tools, constellation, policy)
 
-      aliases = build_alias_map(tools, constellation, policy)
+        {omens, unsupported, rejected, normalization, lossy} =
+          analyze_tools(grimoire, policy)
 
-      finished = System.monotonic_time(:microsecond)
+        aliases = build_alias_map(grimoire, policy)
+        finished = System.monotonic_time(:microsecond)
 
-      UpstreamShrine.stop(upstream_pid)
-
-      {:ok,
-       %{
-         server_info: Map.get(init_result, "serverInfo"),
-         protocol_revision: Map.get(init_result, "protocolVersion"),
-         capabilities: Map.get(init_result, "capabilities", %{}),
-         tool_count: length(tools),
-         schema_valid: not Enum.any?(omens, &(&1.severity == :rejected)),
-         unsupported_constructs: unsupported,
-         normalization_operations: normalization,
-         lossy_operations: lossy,
-         rejected_tools: rejected,
-         aliases: aliases,
-         omens: omens,
-         duration_us: finished - started
-       }}
-    end
+        {:ok,
+         %{
+           server_info: Map.get(init_result, "serverInfo"),
+           protocol_revision: Map.get(init_result, "protocolVersion"),
+           capabilities: Map.get(init_result, "capabilities", %{}),
+           tool_count: length(tools),
+           schema_valid: not Enum.any?(omens, &(&1.severity == :rejected)),
+           unsupported_constructs: unsupported,
+           normalization_operations: normalization,
+           lossy_operations: lossy,
+           rejected_tools: rejected,
+           aliases: aliases,
+           omens: omens,
+           duration_us: finished - started
+         }}
+      end
+    end)
   end
 
-  defp analyze_tools(tools, constellation, policy) do
-    profile_name = constellation.name
-
+  defp analyze_tools(%ToolGrimoire{entries: entries}, policy) do
     {omens, unsupported, rejected, normalization, lossy} =
-      Enum.reduce(tools, {[], [], [], [], []}, fn tool, {o_acc, u_acc, r_acc, n_acc, l_acc} ->
-        schema = Map.get(tool, "inputSchema", %{})
-        tool_name = Map.get(tool, "name", "unknown")
+      Enum.reduce(entries, {[], [], [], [], []}, fn entry, {o_acc, u_acc, r_acc, n_acc, l_acc} ->
+        unsupported_constructs =
+          case Pipeline.compile(entry.input_schema) do
+            {:ok, result} -> find_unsupported(result.scroll)
+            {:error, _error} -> []
+          end
 
-        case Pipeline.compile(schema) do
-          {:ok, result} ->
-            projection = Projector.project(result.scroll, constellation, policy)
+        tool_omens = entry.omens
+        n_ops = Enum.filter(tool_omens, &(&1.severity == :normalized))
+        l_ops = Enum.filter(tool_omens, &(&1.severity == :lossy))
 
-            tool_omens =
-              Enum.map(result.omens ++ projection.omens, fn omen ->
-                %{omen | tool: omen.tool || tool_name, profile: omen.profile || profile_name}
-              end)
+        rejected_names =
+          if published_entry?(entry, policy), do: r_acc, else: r_acc ++ [entry.name]
 
-            unsupported_constructs = find_unsupported(result.scroll)
-
-            rejected_tool =
-              not projection.accepted or Enum.any?(tool_omens, &(&1.severity == :rejected))
-
-            n_ops = Enum.filter(tool_omens, &(&1.severity == :normalized))
-            l_ops = Enum.filter(tool_omens, &(&1.severity == :lossy))
-            rejected_names = if rejected_tool, do: r_acc ++ [tool_name], else: r_acc
-
-            {o_acc ++ tool_omens, u_acc ++ unsupported_constructs, rejected_names, n_acc ++ n_ops,
-             l_acc ++ l_ops}
-
-          {:error, _error} ->
-            omen = %Omen{
-              code: "NYA-SCHEMA-001",
-              severity: :rejected,
-              schema_path: [],
-              rule: "validation_failed",
-              source: nil,
-              target: nil,
-              semantics_preserved: false,
-              explanation: "schema failed validation",
-              action: nil,
-              tool: tool_name,
-              profile: profile_name
-            }
-
-            {o_acc ++ [omen], u_acc, r_acc ++ [tool_name], n_acc, l_acc}
-        end
+        {o_acc ++ tool_omens, u_acc ++ unsupported_constructs, rejected_names, n_acc ++ n_ops,
+         l_acc ++ l_ops}
       end)
 
     {omens, Enum.uniq(unsupported), Enum.uniq(rejected), normalization, lossy}
@@ -364,12 +337,15 @@ defmodule Nyanform.CLI do
     end
   end
 
-  defp build_alias_map(tools, constellation, policy) do
-    grimoire = ToolGrimoire.build(tools, constellation, policy)
-
+  defp build_alias_map(%ToolGrimoire{} = grimoire, policy) do
     grimoire.entries
+    |> Enum.filter(&published_entry?(&1, policy))
     |> Enum.map(fn entry -> {entry.name, entry.alias} end)
     |> Map.new()
+  end
+
+  defp published_entry?(entry, policy) do
+    entry.publishable and (entry.accepted or policy == :permissive)
   end
 
   defp matrix_cmd(args) do
@@ -436,25 +412,21 @@ defmodule Nyanform.CLI do
   end
 
   defp run_matrix(upstream_config, profiles, policy) do
-    with {:ok, upstream_pid} <- UpstreamShrine.start_link(upstream_config),
-         {:ok, _init} <- UpstreamShrine.initialize(upstream_pid),
-         {:ok, tools_msg} <- UpstreamShrine.list_tools(upstream_pid) do
-      tools_result = tools_msg.result || %{}
-      tools = Map.get(tools_result, "tools", [])
-      UpstreamShrine.stop(upstream_pid)
+    with_initialized_upstream(upstream_config, fn upstream_pid, _init ->
+      with {:ok, tools} <- list_all_tools(upstream_pid) do
+        results =
+          Task.Supervisor.async_stream(
+            Nyanform.Compile.TaskSupervisor,
+            profiles,
+            fn profile -> compile_profile(tools, profile, policy) end,
+            max_concurrency: Limits.default().max_concurrent_compilation,
+            timeout: 30_000
+          )
+          |> Enum.map(fn {:ok, result} -> result end)
 
-      results =
-        Task.Supervisor.async_stream(
-          Nyanform.Compile.TaskSupervisor,
-          profiles,
-          fn profile -> compile_profile(tools, profile, policy) end,
-          max_concurrency: 8,
-          timeout: 30_000
-        )
-        |> Enum.map(fn {:ok, result} -> result end)
-
-      {:ok, results}
-    end
+        {:ok, results}
+      end
+    end)
   end
 
   defp compile_profile(tools, profile_name, policy) do
@@ -469,7 +441,13 @@ defmodule Nyanform.CLI do
           case Pipeline.compile(entry.input_schema) do
             {:ok, result} ->
               projection = Projector.project(result.scroll, constellation, policy)
-              {projection.omens ++ result.omens, result.digest, projection.accepted}
+
+              omens =
+                Enum.map(projection.omens ++ result.omens, fn omen ->
+                  %{omen | tool: omen.tool || entry.name, profile: omen.profile || profile_name}
+                end)
+
+              {omens, result.digest, projection.accepted}
 
             {:error, _} ->
               {[
@@ -578,24 +556,20 @@ defmodule Nyanform.CLI do
   end
 
   defp run_snapshot(upstream_config) do
-    with {:ok, upstream_pid} <- UpstreamShrine.start_link(upstream_config),
-         {:ok, init_msg} <- UpstreamShrine.initialize(upstream_pid),
-         {:ok, tools_msg} <- UpstreamShrine.list_tools(upstream_pid) do
+    with_initialized_upstream(upstream_config, fn upstream_pid, init_msg ->
       init_result = init_msg.result || %{}
-      tools_result = tools_msg.result || %{}
-      tools = Map.get(tools_result, "tools", [])
-      UpstreamShrine.stop(upstream_pid)
 
-      snapshot = build_snapshot(init_result, tools)
-      {:ok, snapshot}
-    end
+      with {:ok, tools} <- list_all_tools(upstream_pid) do
+        {:ok, build_snapshot(init_result, tools)}
+      end
+    end)
   end
 
   defp build_snapshot(init_result, tools) do
     tool_snapshots =
       tools
       |> Enum.map(fn tool ->
-        schema = Map.get(tool, "inputSchema", %{})
+        schema = tool_input_schema(tool)
 
         {digest, scroll_kind} =
           case Pipeline.compile(schema) do
@@ -604,14 +578,15 @@ defmodule Nyanform.CLI do
           end
 
         %{
-          name: Map.get(tool, "name"),
-          description: Map.get(tool, "description"),
+          name: cli_tool_name(tool),
+          description: tool_field(tool, "description"),
           input_schema: schema,
-          output_schema: Map.get(tool, "outputSchema"),
+          output_schema: tool_field(tool, "outputSchema"),
           digest: digest,
           schema_kind: scroll_kind
         }
       end)
+      |> Enum.sort_by(& &1.name)
 
     %{
       server_info: Map.get(init_result, "serverInfo"),
@@ -665,33 +640,105 @@ defmodule Nyanform.CLI do
   end
 
   defp run_check(upstream_config, stored_snapshot) do
-    with {:ok, upstream_pid} <- UpstreamShrine.start_link(upstream_config),
-         {:ok, _init} <- UpstreamShrine.initialize(upstream_pid),
-         {:ok, tools_msg} <- UpstreamShrine.list_tools(upstream_pid) do
-      tools_result = tools_msg.result || %{}
-      live_tools = Map.get(tools_result, "tools", [])
-      UpstreamShrine.stop(upstream_pid)
+    with_initialized_upstream(upstream_config, fn upstream_pid, _init ->
+      with {:ok, live_tools} <- list_all_tools(upstream_pid) do
+        stored_tools = Map.get(stored_snapshot, "tools", [])
+        changes = compare_tools(stored_tools, live_tools)
 
-      stored_tools = Map.get(stored_snapshot, "tools", [])
+        {:ok,
+         %{
+           changes: changes,
+           has_breaking: Enum.any?(changes, &(&1.classification == :breaking)),
+           has_potentially_breaking:
+             Enum.any?(changes, &(&1.classification == :potentially_breaking))
+         }}
+      end
+    end)
+  end
 
-      changes = compare_tools(stored_tools, live_tools)
+  defp with_initialized_upstream(upstream_config, operation) do
+    case UpstreamShrine.start_link(upstream_config) do
+      {:ok, upstream_pid} ->
+        try do
+          with {:ok, init_msg} <- UpstreamShrine.initialize(upstream_pid) do
+            operation.(upstream_pid, init_msg)
+          end
+        after
+          if Process.alive?(upstream_pid), do: UpstreamShrine.stop(upstream_pid)
+        end
 
-      {:ok,
-       %{
-         changes: changes,
-         has_breaking: Enum.any?(changes, &(&1.classification == :breaking)),
-         has_potentially_breaking:
-           Enum.any?(changes, &(&1.classification == :potentially_breaking))
-       }}
+      error ->
+        error
+    end
+  end
+
+  defp list_all_tools(upstream_pid) do
+    list_tools_page(upstream_pid, %{}, [], 0, %{}, Limits.default().max_tool_count)
+  end
+
+  defp list_tools_page(upstream_pid, params, pages, count, seen_cursors, limit) do
+    with {:ok, tools_msg} <- UpstreamShrine.list_tools(upstream_pid, params) do
+      case tools_msg.result do
+        result when is_map(result) ->
+          case Map.get(result, "tools", []) do
+            tools when is_list(tools) ->
+              continue_tools_page(
+                upstream_pid,
+                result,
+                tools,
+                pages,
+                count,
+                seen_cursors,
+                limit
+              )
+
+            _invalid_tools ->
+              {:error, :invalid_tools_catalog}
+          end
+
+        _invalid_result ->
+          {:error, :invalid_tools_result}
+      end
+    end
+  end
+
+  defp continue_tools_page(upstream_pid, result, tools, pages, count, seen_cursors, limit) do
+    next_count = count + length(tools)
+
+    cond do
+      next_count > limit ->
+        {:error, {:max_tool_count_exceeded, limit}}
+
+      is_nil(Map.get(result, "nextCursor")) ->
+        {:ok, pages |> Enum.reverse([tools]) |> List.flatten()}
+
+      not is_binary(Map.get(result, "nextCursor")) ->
+        {:error, :invalid_next_cursor}
+
+      Map.has_key?(seen_cursors, Map.get(result, "nextCursor")) ->
+        {:error, :pagination_cycle}
+
+      true ->
+        cursor = Map.fetch!(result, "nextCursor")
+
+        list_tools_page(
+          upstream_pid,
+          %{"cursor" => cursor},
+          [tools | pages],
+          next_count,
+          Map.put(seen_cursors, cursor, true),
+          limit
+        )
     end
   end
 
   defp compare_tools(stored, live) do
-    stored_by_name = Map.new(stored, &{&1["name"], &1})
-    live_by_name = Map.new(live, &{&1["name"], &1})
+    stored_by_name = Map.new(stored, &{cli_tool_name(&1), normalize_tool_map(&1, :stored)})
+    live_by_name = Map.new(live, &{cli_tool_name(&1), normalize_tool_map(&1, :live)})
 
     all_names =
       MapSet.union(MapSet.new(Map.keys(stored_by_name)), MapSet.new(Map.keys(live_by_name)))
+      |> Enum.sort()
 
     Enum.flat_map(all_names, fn name ->
       stored_tool = Map.get(stored_by_name, name)
@@ -724,15 +771,27 @@ defmodule Nyanform.CLI do
   end
 
   defp classify_change(name, stored_tool, live_tool) do
+    stored_input_schema =
+      Map.get(stored_tool, "input_schema", Map.get(stored_tool, "inputSchema", %{}))
+
+    live_input_schema =
+      Map.get(live_tool, "input_schema", Map.get(live_tool, "inputSchema", %{}))
+
+    stored_output_schema =
+      Map.get(stored_tool, "output_schema") || Map.get(stored_tool, "outputSchema") || %{}
+
+    live_output_schema =
+      Map.get(live_tool, "output_schema") || Map.get(live_tool, "outputSchema") || %{}
+
     digests = %{
-      stored_input: Map.get(stored_tool, "digest"),
-      live_input:
-        digest_of(Map.get(live_tool, "input_schema", Map.get(live_tool, "inputSchema", %{}))),
-      stored_output: digest_of(Map.get(stored_tool, "output_schema") || %{}),
-      live_output:
-        digest_of(
-          Map.get(live_tool, "output_schema") || Map.get(live_tool, "outputSchema") || %{}
-        )
+      stored_input: digest_of(stored_input_schema),
+      live_input: digest_of(live_input_schema),
+      stored_output: digest_of(stored_output_schema),
+      live_output: digest_of(live_output_schema),
+      stored_input_schema: stored_input_schema,
+      live_input_schema: live_input_schema,
+      stored_output_schema: stored_output_schema,
+      live_output_schema: live_output_schema
     }
 
     classify_by_digest(name, digests, stored_tool, live_tool)
@@ -748,13 +807,24 @@ defmodule Nyanform.CLI do
   defp classify_by_digest(name, digests, stored_tool, live_tool) do
     stored_desc = Map.get(stored_tool, "description")
     live_desc = Map.get(live_tool, "description")
-    inputs_match = digests.stored_input == digests.live_input
-    outputs_match = digests.stored_output == digests.live_output
+
+    inputs_match =
+      schemas_match?(
+        digests.stored_input,
+        digests.live_input,
+        digests.stored_input_schema,
+        digests.live_input_schema
+      )
+
+    outputs_match =
+      schemas_match?(
+        digests.stored_output,
+        digests.live_output,
+        digests.stored_output_schema,
+        digests.live_output_schema
+      )
 
     cond do
-      inputs_match and outputs_match ->
-        []
-
       stored_desc != live_desc and same_schema_ignoring_desc?(stored_tool, live_tool) and
           outputs_match ->
         [
@@ -765,6 +835,9 @@ defmodule Nyanform.CLI do
             "only description changed; schema semantics unchanged"
           )
         ]
+
+      inputs_match and outputs_match ->
+        []
 
       digests.stored_input != nil and digests.live_input != nil ->
         [
@@ -788,6 +861,15 @@ defmodule Nyanform.CLI do
     end
   end
 
+  defp schemas_match?(left_digest, right_digest, _left_schema, _right_schema)
+       when is_binary(left_digest) and is_binary(right_digest) do
+    left_digest == right_digest
+  end
+
+  defp schemas_match?(_left_digest, _right_digest, left_schema, right_schema) do
+    left_schema == right_schema
+  end
+
   defp change_entry(name, classification, change, detail) do
     %{tool: name, classification: classification, change: change, detail: detail}
   end
@@ -796,11 +878,45 @@ defmodule Nyanform.CLI do
     stored_schema = Map.get(stored, "input_schema", Map.get(stored, "inputSchema", %{}))
     live_schema = Map.get(live, "input_schema", Map.get(live, "inputSchema", %{}))
 
-    stored_without_desc = Map.delete(stored_schema, "description")
-    live_without_desc = Map.delete(live_schema, "description")
+    stored_without_desc = drop_schema_description(stored_schema)
+    live_without_desc = drop_schema_description(live_schema)
 
     canonical_equal?(stored_without_desc, live_without_desc)
   end
+
+  defp tool_input_schema(tool) when is_map(tool) do
+    case Map.fetch(tool, "inputSchema") do
+      {:ok, schema} -> schema
+      :error -> nil
+    end
+  end
+
+  defp tool_input_schema(tool), do: tool
+
+  defp tool_field(tool, key) when is_map(tool), do: Map.get(tool, key)
+  defp tool_field(_tool, _key), do: nil
+
+  defp cli_tool_name(%{"name" => name}) when is_binary(name), do: name
+
+  defp cli_tool_name(tool) do
+    suffix = tool |> :erlang.term_to_binary() |> then(&:crypto.hash(:sha256, &1))
+    suffix = Base.encode16(suffix, case: :lower)
+
+    "invalid_tool_" <> String.slice(suffix, 0, 8)
+  end
+
+  defp normalize_tool_map(tool, _source) when is_map(tool), do: tool
+
+  defp normalize_tool_map(tool, :stored) do
+    %{"name" => cli_tool_name(tool), "input_schema" => tool}
+  end
+
+  defp normalize_tool_map(tool, :live) do
+    %{"name" => cli_tool_name(tool), "inputSchema" => tool}
+  end
+
+  defp drop_schema_description(schema) when is_map(schema), do: Map.delete(schema, "description")
+  defp drop_schema_description(schema), do: schema
 
   defp canonical_equal?(left, right) do
     with {:ok, l} <- Pipeline.compile(left),
@@ -914,7 +1030,7 @@ defmodule Nyanform.CLI do
 
   defp help do
     IO.puts("""
-    Nyanform — Make one MCP server work everywhere.
+    Nyanform — Inspect and adapt MCP tool schemas across client boundaries.
 
     Usage: nyanform <command> [options]
 
@@ -922,7 +1038,7 @@ defmodule Nyanform.CLI do
       serve      Run as a proxy between a client and an upstream MCP server
       inspect    Connect to a server, validate schemas, print a report
       matrix     Compile a server against every compatibility profile
-      snapshot   Save a deterministic canonical snapshot
+      snapshot   Save selected catalog fields with canonical input digests
       check      Compare a live server with a stored snapshot
       doctor     Check configuration and environment
 

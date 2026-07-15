@@ -85,7 +85,7 @@
       ]
     },
     "profile": {
-      "description": "Compatibility profile used to project upstream schemas. Use auto to detect from clientInfo.name at initialize time.",
+      "description": "Compatibility profile used to project upstream schemas. Auto selects only recognized clientInfo.name mappings and otherwise falls back to canonical; provider-dependent clients should use an explicit profile.",
       "type": "string",
       "enum": ["canonical", "claude", "gemini", "openai_strict", "vscode", "passthrough", "auto"],
       "default": "canonical"

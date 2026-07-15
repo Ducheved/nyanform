@@ -47,13 +47,13 @@ defmodule Nyanform.RegressionRound3Test do
 
       result = project(raw, "gemini")
 
-      refute result.accepted
+      assert result.accepted
       assert result.schema["properties"]["value"] == %{"type" => "string", "enum" => ["fixed"]}
 
       assert Enum.any?(
                result.omens,
-               &(&1.rule == "const_unsupported" and
-                   &1.schema_path == ["properties", "value"] and &1.severity == :rejected)
+               &(&1.rule == "const_to_enum" and
+                   &1.schema_path == ["properties", "value"] and &1.severity == :normalized)
              )
     end
 
@@ -143,11 +143,20 @@ defmodule Nyanform.RegressionRound3Test do
     end
 
     test "local-only profiles accept local pointers but reject external references" do
-      local = project(%{"$ref" => "#/urn:local"}, "gemini")
+      local =
+        project(
+          %{
+            "$ref" => "#/$defs/Local",
+            "$defs" => %{"Local" => %{"type" => "string"}}
+          },
+          "gemini"
+        )
+
       external = project(%{"$ref" => "other.json#/Foo"}, "gemini")
 
       assert local.accepted
-      assert local.schema == %{"$ref" => "#/urn:local"}
+      assert local.schema["$ref"] == "#/$defs/Local"
+      assert local.schema["$defs"]["Local"] == %{"type" => "string"}
       refute external.accepted
       assert Enum.any?(external.omens, &(&1.rule == "reference_unsupported"))
     end

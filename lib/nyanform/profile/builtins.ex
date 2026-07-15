@@ -26,8 +26,8 @@ defmodule Nyanform.Profile.Builtins do
   defp canonical do
     %Constellation{
       name: "canonical",
-      label: "Canonical MCP",
-      description: "Nyanform canonical representation, no projection applied",
+      label: "Nyanform normalized",
+      description: "Nyanform's modeled JSON Schema projection for MCP tools",
       accepted_keywords:
         MapSet.new(~w(type properties required additionalProperties patternProperties
           items additionalItems minItems maxItems uniqueItems description title
@@ -43,6 +43,8 @@ defmodule Nyanform.Profile.Builtins do
       supported_array_forms: MapSet.new([:homogeneous, :tuple, :no_items]),
       supported_enum_forms: MapSet.new([:homogeneous, :mixed, :empty]),
       max_schema_depth: :unlimited,
+      tool_name_pattern: "^[a-zA-Z0-9_.-]{1,128}$",
+      max_tool_name_length: 128,
       supports_const: true,
       supports_pattern_properties: true
     }
@@ -67,10 +69,9 @@ defmodule Nyanform.Profile.Builtins do
       supports_additional_properties_false: true,
       supported_array_forms: MapSet.new([:homogeneous, :tuple]),
       supported_enum_forms: MapSet.new([:homogeneous, :mixed]),
-      max_schema_depth: 64,
+      max_schema_depth: :unlimited,
       tool_name_pattern: "^[a-zA-Z0-9_-]{1,64}$",
       max_tool_name_length: 64,
-      max_description_length: 1024,
       supports_const: true,
       supports_pattern_properties: false
     }
@@ -81,7 +82,7 @@ defmodule Nyanform.Profile.Builtins do
       name: "gemini",
       label: "Gemini CLI",
       description:
-        "Nyanform compatibility profile for Gemini CLI. Not an official Google specification.",
+        "Nyanform compatibility hypothesis informed by documented Gemini CLI MCP sanitization.",
       accepted_keywords: MapSet.new(~w(type properties required additionalProperties
           items description enum format
           minimum maximum minLength maxLength
@@ -91,13 +92,12 @@ defmodule Nyanform.Profile.Builtins do
       nullable_representation: :type_array,
       requires_all_properties_required: false,
       accepts_additional_properties: true,
-      supports_additional_properties_false: false,
+      supports_additional_properties_false: true,
       supported_array_forms: MapSet.new([:homogeneous]),
       supported_enum_forms: MapSet.new([:homogeneous]),
-      max_schema_depth: 32,
-      tool_name_pattern: "^[a-zA-Z][a-zA-Z0-9_-]{0,63}$",
-      max_tool_name_length: 64,
-      max_description_length: 1024,
+      max_schema_depth: :unlimited,
+      tool_name_pattern: "^[a-zA-Z0-9_.:-]{1,63}$",
+      max_tool_name_length: 63,
       integer_vs_number_distinguished: true,
       supports_const: false,
       supports_pattern_properties: false
@@ -111,23 +111,27 @@ defmodule Nyanform.Profile.Builtins do
       description:
         "Nyanform compatibility profile for OpenAI strict function-calling tools. Not an official OpenAI specification.",
       accepted_keywords: MapSet.new(~w(type properties required additionalProperties
-          items description enum const
+          items description enum
           minimum maximum exclusiveMinimum exclusiveMaximum multipleOf
-          minItems maxItems minLength maxLength)),
-      supported_combinators: MapSet.new(),
-      reference_support: :none,
+          minItems maxItems pattern format anyOf $ref $defs)),
+      supported_combinators: MapSet.new([:anyOf]),
+      reference_support: :local_only,
       nullable_representation: :type_array,
       requires_all_properties_required: true,
+      requires_additional_properties_false: true,
+      requires_root_object: true,
       accepts_additional_properties: true,
       supports_additional_properties_false: true,
       supported_array_forms: MapSet.new([:homogeneous]),
       supported_enum_forms: MapSet.new([:homogeneous]),
-      max_schema_depth: 16,
+      max_schema_depth: :unlimited,
+      max_object_depth: 10,
+      supported_formats:
+        MapSet.new(~w(date-time time date duration email hostname ipv4 ipv6 uuid)),
       tool_name_pattern: "^[a-zA-Z0-9_-]{1,64}$",
       max_tool_name_length: 64,
-      max_description_length: 1024,
       integer_vs_number_distinguished: true,
-      supports_const: true,
+      supports_const: false,
       supports_pattern_properties: false
     }
   end
@@ -150,10 +154,9 @@ defmodule Nyanform.Profile.Builtins do
       supports_additional_properties_false: true,
       supported_array_forms: MapSet.new([:homogeneous, :tuple]),
       supported_enum_forms: MapSet.new([:homogeneous, :mixed]),
-      max_schema_depth: 64,
+      max_schema_depth: :unlimited,
       tool_name_pattern: "^[a-zA-Z0-9_.-]{1,128}$",
       max_tool_name_length: 128,
-      max_description_length: 2048,
       supports_const: true,
       supports_pattern_properties: false
     }
@@ -163,7 +166,7 @@ defmodule Nyanform.Profile.Builtins do
     %Constellation{
       name: "passthrough",
       label: "Passthrough",
-      description: "No transformation; schemas forwarded unchanged",
+      description: "Raw schema projection after structural compilation",
       accepted_keywords:
         MapSet.new(~w(type properties required additionalProperties patternProperties
           items additionalItems minItems maxItems uniqueItems description title
@@ -179,6 +182,8 @@ defmodule Nyanform.Profile.Builtins do
       supported_array_forms: MapSet.new([:homogeneous, :tuple, :no_items]),
       supported_enum_forms: MapSet.new([:homogeneous, :mixed, :empty]),
       max_schema_depth: :unlimited,
+      tool_name_pattern: "^[a-zA-Z0-9_.-]{1,128}$",
+      max_tool_name_length: 128,
       supports_const: true,
       supports_pattern_properties: true
     }

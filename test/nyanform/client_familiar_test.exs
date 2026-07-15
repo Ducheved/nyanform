@@ -16,10 +16,16 @@ defmodule Nyanform.ClientFamiliarTest do
       assert result.confidence == :known
     end
 
-    test "detects cursor as openai_strict" do
+    test "does not guess a provider profile for cursor" do
       result = ClientFamiliar.detect(%{"name" => "Cursor", "version" => "0.40"})
-      assert result.profile == "openai_strict"
-      assert result.confidence == :known
+      assert result.profile == "canonical"
+      assert result.confidence == :unknown
+    end
+
+    test "does not guess a provider profile for continue" do
+      result = ClientFamiliar.detect(%{"name" => "Continue", "version" => "1.0"})
+      assert result.profile == "canonical"
+      assert result.confidence == :unknown
     end
 
     test "detects vscode clients" do

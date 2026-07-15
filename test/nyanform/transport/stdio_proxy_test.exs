@@ -61,6 +61,26 @@ defmodule Nyanform.Transport.StdioProxyTest do
       assert String.contains?(content["text"], "k")
       assert String.contains?(content["text"], "v")
     end
+
+    test "strict profile hides projection-incompatible tools and blocks direct calls" do
+      input = """
+      {"jsonrpc":"2.0","id":"1","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
+      {"jsonrpc":"2.0","method":"notifications/initialized"}
+      {"jsonrpc":"2.0","id":"2","method":"tools/list","params":{}}
+      {"jsonrpc":"2.0","id":"3","method":"tools/call","params":{"name":"union_tool","arguments":{}}}
+      """
+
+      {output, 0} = run_proxy(input, @fixture_server, "openai_strict")
+      lines = String.split(output, "\n", trim: true)
+      tools = find_response(lines, "2")["result"]["tools"]
+      names = Enum.map(tools, & &1["name"])
+
+      refute "union_tool" in names
+      refute "invalid_array_tool" in names
+
+      call_response = find_response(lines, "3")
+      assert call_response["error"]["code"] == -32_601
+    end
   end
 
   describe "stdout protocol purity" do
@@ -113,12 +133,15 @@ defmodule Nyanform.Transport.StdioProxyTest do
   end
 
   describe "server initiated messages" do
-    test "forwards upstream notifications while stdin remains idle" do
+    test "drains upstream notifications before EOF shutdown" do
       input =
-        ~s|{"jsonrpc":"2.0","id":"1","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}\n|
+        """
+        {"jsonrpc":"2.0","id":"1","method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
+        {"jsonrpc":"2.0","method":"notifications/initialized"}
+        {"jsonrpc":"2.0","id":"2","method":"tools/list","params":{}}
+        """
 
-      {output, 0} =
-        run_proxy(input, @push_server, "canonical", hold_open_seconds: 3)
+      {output, 0} = run_proxy(input, @push_server, "canonical")
 
       messages =
         output
@@ -129,7 +152,7 @@ defmodule Nyanform.Transport.StdioProxyTest do
     end
   end
 
-  defp run_proxy(input, command, profile, opts \\ []) do
+  defp run_proxy(input, command, profile) do
     suffix = :erlang.unique_integer([:positive])
     tmp_input = Path.join(System.tmp_dir!(), "nyanform_test_#{suffix}.txt")
     tmp_runner = Path.join(System.tmp_dir!(), "nyanform_test_#{suffix}.exs")
@@ -139,11 +162,7 @@ defmodule Nyanform.Transport.StdioProxyTest do
     File.write!(tmp_runner, runner_script(cli_args))
 
     try do
-      run_with_redirected_input(
-        tmp_input,
-        tmp_runner,
-        Keyword.get(opts, :hold_open_seconds, 0)
-      )
+      run_with_redirected_input(tmp_input, tmp_runner)
     after
       File.rm(tmp_input)
       File.rm(tmp_runner)
@@ -167,29 +186,27 @@ defmodule Nyanform.Transport.StdioProxyTest do
       "System.halt(Nyanform.CLI.main(" <> inspect(cli_args) <> "))\n"
   end
 
-  defp run_with_redirected_input(input_path, runner_path, hold_open_seconds) do
+  defp run_with_redirected_input(input_path, runner_path) do
     if windows?() do
-      run_windows_redirect(input_path, runner_path, hold_open_seconds)
+      run_windows_redirect(input_path, runner_path)
     else
-      input_command = unix_input_command(input_path, hold_open_seconds)
-
       command =
-        "#{input_command} | #{shell_quote(mix_executable())} run #{shell_quote(runner_path)}"
+        "cat #{shell_quote(input_path)} | #{shell_quote(mix_executable())} run --no-compile #{shell_quote(runner_path)}"
 
       System.cmd("sh", ["-c", command], command_options())
     end
   end
 
-  defp run_windows_redirect(input_path, runner_path, hold_open_seconds) do
+  defp run_windows_redirect(input_path, runner_path) do
     command_path = input_path <> ".cmd"
-    input_command = windows_input_command(input_path, hold_open_seconds)
 
     command =
       "@echo off\n" <>
-        input_command <>
+        "type " <>
+        windows_quote(input_path) <>
         " | call " <>
         windows_quote(mix_executable()) <>
-        " run " <> windows_quote(runner_path) <> "\nexit /b %errorlevel%\n"
+        " run --no-compile " <> windows_quote(runner_path) <> "\nexit /b %errorlevel%\n"
 
     File.write!(command_path, command)
 
@@ -199,36 +216,6 @@ defmodule Nyanform.Transport.StdioProxyTest do
       File.rm(command_path)
     end
   end
-
-  defp windows_input_command(input_path, 0), do: "type #{windows_quote(input_path)}"
-
-  defp windows_input_command(input_path, seconds) do
-    Enum.join(
-      [
-        windows_quote(node_executable()),
-        windows_quote(Path.expand("test/fixtures/hold_stdin.js")),
-        windows_quote(input_path),
-        Integer.to_string(seconds)
-      ],
-      " "
-    )
-  end
-
-  defp unix_input_command(input_path, 0), do: "cat #{shell_quote(input_path)}"
-
-  defp unix_input_command(input_path, seconds) do
-    Enum.join(
-      [
-        shell_quote(node_executable()),
-        shell_quote(Path.expand("test/fixtures/hold_stdin.js")),
-        shell_quote(input_path),
-        Integer.to_string(seconds)
-      ],
-      " "
-    )
-  end
-
-  defp node_executable, do: System.find_executable("node") || "node"
 
   defp command_options do
     [stderr_to_stdout: false, env: %{"MIX_ENV" => "test"}, cd: File.cwd!()]

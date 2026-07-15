@@ -189,11 +189,11 @@ defmodule Nyanform.Config.Loader do
     if Enum.all?(env, fn {key, value} -> is_binary(key) and is_binary(value) end) do
       {:ok, env}
     else
-      {:error, {:invalid_upstream_env, env}}
+      {:error, {:invalid_upstream_env, :redacted}}
     end
   end
 
-  defp validate_env(env), do: {:error, {:invalid_upstream_env, env}}
+  defp validate_env(_env), do: {:error, {:invalid_upstream_env, :redacted}}
 
   defp validate_logging("quiet"), do: {:ok, :quiet}
   defp validate_logging("normal"), do: {:ok, :normal}

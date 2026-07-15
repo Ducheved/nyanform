@@ -80,9 +80,9 @@ defmodule Nyanform.Transport.UpstreamShrine do
     end
   end
 
-  @spec list_tools(pid()) :: {:ok, Message.t()} | {:error, term()}
-  def list_tools(pid) do
-    msg = Message.request(Lifecycle.generate_id(), "tools/list", %{})
+  @spec list_tools(pid(), map()) :: {:ok, Message.t()} | {:error, term()}
+  def list_tools(pid, params \\ %{}) do
+    msg = Message.request(Lifecycle.generate_id(), "tools/list", params)
     request(pid, msg)
   end
 
@@ -96,6 +96,16 @@ defmodule Nyanform.Transport.UpstreamShrine do
   @spec server_info(pid()) :: map() | nil
   def server_info(pid) do
     GenServer.call(pid, :server_info)
+  end
+
+  @spec sync(pid()) :: :ok | {:error, term()}
+  def sync(pid) do
+    message = Message.request(Lifecycle.generate_id(), "ping", %{})
+
+    case request(pid, message) do
+      {:ok, _response} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   @spec stop(pid()) :: :ok

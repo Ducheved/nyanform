@@ -55,6 +55,21 @@ defmodule Nyanform.Diagnostic.Codes do
       severity: :rejected,
       summary: "reference cycle detected"
     },
+    "NYA-SCHEMA-012" => %{
+      category: :schema,
+      severity: :lossy,
+      summary: "schema definitions dropped"
+    },
+    "NYA-SCHEMA-013" => %{
+      category: :schema,
+      severity: :rejected,
+      summary: "required property is not declared"
+    },
+    "NYA-SCHEMA-014" => %{
+      category: :schema,
+      severity: :rejected,
+      summary: "local reference target is missing"
+    },
     "NYA-PROFILE-001" => %{
       category: :profile,
       severity: :normalized,
@@ -82,13 +97,38 @@ defmodule Nyanform.Diagnostic.Codes do
     },
     "NYA-PROFILE-006" => %{
       category: :profile,
-      severity: :rejected,
-      summary: "const unsupported by profile"
+      severity: :normalized,
+      summary: "const converted to single-value enum"
     },
     "NYA-PROFILE-007" => %{
       category: :profile,
       severity: :normalized,
       summary: "description truncated"
+    },
+    "NYA-PROFILE-008" => %{
+      category: :profile,
+      severity: :rejected,
+      summary: "root object required"
+    },
+    "NYA-PROFILE-009" => %{
+      category: :profile,
+      severity: :rejected,
+      summary: "profile nesting limit exceeded"
+    },
+    "NYA-PROFILE-010" => %{
+      category: :profile,
+      severity: :rejected,
+      summary: "allOf unsupported by profile"
+    },
+    "NYA-PROFILE-011" => %{
+      category: :profile,
+      severity: :lossy,
+      summary: "closed object required by profile"
+    },
+    "NYA-PROFILE-012" => %{
+      category: :profile,
+      severity: :lossy,
+      summary: "unsupported schema keyword dropped"
     },
     "NYA-ALIAS-001" => %{
       category: :alias,
@@ -149,6 +189,11 @@ defmodule Nyanform.Diagnostic.Codes do
       category: :argument,
       severity: :rejected,
       summary: "argument repair rejected"
+    },
+    "NYA-ARG-004" => %{
+      category: :argument,
+      severity: :normalized,
+      summary: "synthetic optional null removed"
     },
     "NYA-CONFIG-001" => %{
       category: :config,

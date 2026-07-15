@@ -28,14 +28,14 @@ rl.on("line", (line) => {
       }
     });
 
-    setTimeout(() => {
-      send({
-        jsonrpc: "2.0",
-        method: "notifications/progress",
-        params: { progress: 1, total: 1 }
-      });
-    }, 200);
   } else if (message.method === "tools/list") {
     send({jsonrpc: "2.0", id: message.id, result: {tools: []}});
+    send({
+      jsonrpc: "2.0",
+      method: "notifications/progress",
+      params: { progress: 1, total: 1 }
+    });
+  } else if (message.method === "ping") {
+    send({jsonrpc: "2.0", id: message.id, result: {}});
   }
 });
